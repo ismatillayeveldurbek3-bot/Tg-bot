@@ -365,11 +365,12 @@ def has_voted(user_id: int) -> bool:
 
 def save_vote(user_id: int, full_name: str, username: str, subject_key: str, teacher_key: str) -> bool:
     """
-    Ovozlarni xavfsiz saqlaydi.
-    Agar foydalanuvchi allaqachon ovoz bergan bo'lsa, xatolik bermasdan False qaytaradi.
-    Bu tugmani tez-tez bosish yoki parallel so'rovlar paytida PRIMARY KEY xatosini oldini oladi.
+    Ovoz saqlaydi.
+    True  = ovoz muvaffaqiyatli saqlandi.
+    False = foydalanuvchi oldin ovoz bergan yoki PRIMARY KEY to'qnashuvi bo'lgan.
     """
     subject_key = normalize_subject_key(subject_key)
+
     try:
         cursor.execute("""
             INSERT INTO votes (user_id, full_name, username, subject_key, teacher_key, voted_at)
@@ -385,7 +386,6 @@ def save_vote(user_id: int, full_name: str, username: str, subject_key: str, tea
         conn.commit()
         return True
     except sqlite3.IntegrityError:
-        # user_id PRIMARY KEY bo'lgani uchun foydalanuvchi ikkinchi marta ovoz bera olmaydi
         return False
 
 # FIX #9: str | None o'rniga Optional[str] — Python 3.9 bilan moslik
@@ -1007,6 +1007,11 @@ async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup: Op
         logging.error(f"safe_edit_message umumiy xato: {e}")
 
 
+
+def add_refresh_time(text: str) -> str:
+    """Telegram edit_text 'message is not modified' xatosini oldini olish uchun vaqt qo'shadi."""
+    return text + f"\n\n⏱ Yangilandi: {datetime.now().strftime('%H:%M:%S')}"
+
 def get_settings_text(user_id: int) -> str:
     script = get_user_script(user_id)
     current = "Lotin" if script == "latin" else "Крилл"
@@ -1444,7 +1449,7 @@ async def check_subscription_handler(callback: CallbackQuery):
 async def go_vote_panel_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
 
-    # Obuna holatini qayta tekshirish: foydalanuvchi kanaldan chiqib ketgan bo'lsa, kirish bekor qilinadi
+    # Ovoz berishdan oldin obuna holati qayta tekshiriladi.
     if not await check_user_subscription(user_id):
         reset_access(user_id)
         await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
@@ -1452,7 +1457,6 @@ async def go_vote_panel_handler(callback: CallbackQuery):
         return
 
     grant_access(user_id)
-
     if has_voted(user_id):
         await safe_edit_message(callback, get_already_voted_text(user_id), home_keyboard(user_id))
         await callback.answer()
@@ -1508,6 +1512,12 @@ async def vote_handler(callback: CallbackQuery):
         await callback.answer(tr(user_id, "Noto'g'ri tanlov."), show_alert=True)
         return
 
+    # Tugma bir necha marta bosilib ketmasligi uchun inline keyboard vaqtincha olib tashlanadi.
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+
     async with db_lock:
         saved = save_vote(
             user_id=user_id,
@@ -1518,7 +1528,8 @@ async def vote_handler(callback: CallbackQuery):
         )
 
     if not saved:
-        await callback.answer("Siz allaqachon ovoz bergansiz.", show_alert=True)
+        await callback.answer(tr(user_id, "Siz allaqachon ovoz bergansiz."), show_alert=True)
+        await safe_edit_message(callback, get_already_voted_text(user_id), home_keyboard(user_id))
         return
 
     text = (
@@ -1626,6 +1637,7 @@ async def refresh_results_user(callback: CallbackQuery):
 
     async with db_lock:
         text = get_subject_results_text(user_id, scope)
+        text = add_refresh_time(text)
 
     await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
     await callback.answer(tr(user_id, "Yangilandi"))
@@ -1672,6 +1684,7 @@ async def refresh_results_admin_general(callback: CallbackQuery):
         return
     async with db_lock:
         text = get_general_results_text(user_id)
+        text = add_refresh_time(text)
     await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
     await callback.answer(tr(user_id, "Yangilandi"))
 
@@ -1708,6 +1721,7 @@ async def refresh_results_admin_handler(callback: CallbackQuery):
 
     async with db_lock:
         text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
+        text = add_refresh_time(text)
 
     await safe_edit_message(callback, text, results_keyboard_admin(user_id, scope))
     await callback.answer(tr(user_id, "Yangilandi"))
@@ -1739,7 +1753,8 @@ async def refresh_rating_stats_callback(callback: CallbackQuery):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
     scope = normalize_subject_key(callback.data.split(":", 1)[1])
-    await safe_edit_message(callback, get_rating_stats_text(user_id, scope), rating_stats_keyboard_admin(user_id, scope))
+    text = add_refresh_time(get_rating_stats_text(user_id, scope))
+    await safe_edit_message(callback, text, rating_stats_keyboard_admin(user_id, scope))
     await callback.answer(tr(user_id, "Yangilandi"))
 
 @dp.callback_query(F.data == "admin_top_ratings")
@@ -1770,7 +1785,8 @@ async def refresh_admin_complaints_callback(callback: CallbackQuery):
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-    await safe_edit_message(callback, get_complaints_text(user_id), complaints_keyboard_admin(user_id))
+    text = add_refresh_time(get_complaints_text(user_id))
+    await safe_edit_message(callback, text, complaints_keyboard_admin(user_id))
     await callback.answer(tr(user_id, "Yangilandi"))
 
 
@@ -1803,7 +1819,8 @@ async def refresh_admin_users(callback: CallbackQuery):
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-    await safe_edit_message(callback, get_users_text(user_id), users_keyboard_admin(user_id))
+    text = add_refresh_time(get_users_text(user_id))
+    await safe_edit_message(callback, text, users_keyboard_admin(user_id))
     await callback.answer(tr(user_id, "Yangilandi"))
 
 @dp.callback_query(F.data == "admin_export_votes_excel")
