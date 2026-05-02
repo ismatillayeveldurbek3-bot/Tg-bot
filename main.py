@@ -1028,9 +1028,9 @@ async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup: Op
 
 
 
-def add_refresh_time(text: str) -> str:
-    """Telegram edit_text 'message is not modified' xatosini oldini olish uchun millisekund qo'shadi."""
-    return text + f"  ⏱ Yangilandi: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}"
+def add_refresh_time(text: str, user_id: int) -> str:
+    """Telegram edit_text 'message is not modified' xatosini oldini olish uchun vaqt qo'shadi."""
+    return text + tr(user_id, f"  ⏱ Yangilandi: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
 
 
 def can_start_refresh(user_id: int, key: str) -> bool:
@@ -1665,6 +1665,14 @@ async def show_results_menu_user(callback: CallbackQuery):
     await safe_edit_message(callback, get_results_menu_text(user_id, False), results_menu_keyboard_user(user_id))
     await callback.answer()
 
+@dp.callback_query(F.data == "show_results_user:general")
+async def show_results_user_general(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with db_lock:
+        text = add_refresh_time(get_general_results_text(user_id), user_id)
+    await safe_edit_message(callback, text, results_keyboard_user(user_id, "general"))
+    await callback.answer()
+
 @dp.callback_query(F.data.startswith("show_results_user:"))
 async def show_results_user(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -1676,11 +1684,28 @@ async def show_results_user(callback: CallbackQuery):
 
     async with db_lock:
         text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-        text = add_refresh_time(text)
+        text = add_refresh_time(text, user_id)
 
     await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
     await callback.answer()
 
+
+@dp.callback_query(F.data == "refresh_results_user:general")
+async def refresh_results_user_general(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    refresh_key = "results_user:general"
+
+    if not can_start_refresh(user_id, refresh_key):
+        await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
+        return
+
+    try:
+        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
+        async with db_lock:
+            text = add_refresh_time(get_general_results_text(user_id), user_id)
+        await safe_edit_message(callback, text, results_keyboard_user(user_id, "general"))
+    finally:
+        finish_refresh(user_id, refresh_key)
 
 @dp.callback_query(F.data.startswith("refresh_results_user:"))
 async def refresh_results_user(callback: CallbackQuery):
@@ -1701,7 +1726,7 @@ async def refresh_results_user(callback: CallbackQuery):
 
         async with db_lock:
             text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-            text = add_refresh_time(text)
+            text = add_refresh_time(text, user_id)
 
         await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
     finally:
@@ -1738,7 +1763,7 @@ async def show_results_admin_general(callback: CallbackQuery):
         return
     async with db_lock:
         text = get_general_results_text(user_id)
-        text = add_refresh_time(text)
+        text = add_refresh_time(text, user_id)
     await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
     await callback.answer()
 
@@ -1759,7 +1784,7 @@ async def refresh_results_admin_general(callback: CallbackQuery):
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
             text = get_general_results_text(user_id)
-            text = add_refresh_time(text)
+            text = add_refresh_time(text, user_id)
         await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
     finally:
         finish_refresh(user_id, refresh_key)
@@ -1779,7 +1804,7 @@ async def show_results_admin(callback: CallbackQuery):
 
     async with db_lock:
         text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-        text = add_refresh_time(text)
+        text = add_refresh_time(text, user_id)
 
     await safe_edit_message(callback, text, results_keyboard_admin(user_id, scope))
     await callback.answer()
@@ -1808,7 +1833,7 @@ async def refresh_results_admin_handler(callback: CallbackQuery):
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
             text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-            text = add_refresh_time(text)
+            text = add_refresh_time(text, user_id)
 
         await safe_edit_message(callback, text, results_keyboard_admin(user_id, scope))
     finally:
@@ -1832,7 +1857,7 @@ async def show_rating_stats_callback(callback: CallbackQuery):
         return
     scope = normalize_subject_key(callback.data.split(":", 1)[1])
     async with db_lock:
-        text = add_refresh_time(get_rating_stats_text(user_id, scope))
+        text = add_refresh_time(get_rating_stats_text(user_id, scope), user_id)
     await safe_edit_message(callback, text, rating_stats_keyboard_admin(user_id, scope))
     await callback.answer()
 
@@ -1854,7 +1879,7 @@ async def refresh_rating_stats_callback(callback: CallbackQuery):
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
-            text = add_refresh_time(get_rating_stats_text(user_id, scope))
+            text = add_refresh_time(get_rating_stats_text(user_id, scope), user_id)
         await safe_edit_message(callback, text, rating_stats_keyboard_admin(user_id, scope))
     finally:
         finish_refresh(user_id, refresh_key)
@@ -1879,7 +1904,7 @@ async def admin_complaints_callback(callback: CallbackQuery):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
     async with db_lock:
-        text = add_refresh_time(get_complaints_text(user_id))
+        text = add_refresh_time(get_complaints_text(user_id), user_id)
     await safe_edit_message(callback, text, complaints_keyboard_admin(user_id))
     await callback.answer()
 
@@ -1900,7 +1925,7 @@ async def refresh_admin_complaints_callback(callback: CallbackQuery):
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
-            text = add_refresh_time(get_complaints_text(user_id))
+            text = add_refresh_time(get_complaints_text(user_id), user_id)
         await safe_edit_message(callback, text, complaints_keyboard_admin(user_id))
     finally:
         finish_refresh(user_id, refresh_key)
@@ -1927,7 +1952,7 @@ async def admin_users_callback(callback: CallbackQuery):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
     async with db_lock:
-        text = add_refresh_time(get_users_text(user_id))
+        text = add_refresh_time(get_users_text(user_id), user_id)
     await safe_edit_message(callback, text, users_keyboard_admin(user_id))
     await callback.answer()
 
@@ -1947,7 +1972,7 @@ async def refresh_admin_users(callback: CallbackQuery):
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
-            text = add_refresh_time(get_users_text(user_id))
+            text = add_refresh_time(get_users_text(user_id), user_id)
         await safe_edit_message(callback, text, users_keyboard_admin(user_id))
     finally:
         finish_refresh(user_id, refresh_key)
