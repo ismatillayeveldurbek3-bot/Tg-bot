@@ -4,6 +4,7 @@ import re
 import asyncio
 import logging
 import sqlite3
+import zipfile
 from datetime import datetime, timezone, timedelta
 from html import escape
 from typing import Optional
@@ -59,6 +60,7 @@ VOTES_XLSX_FILE = os.path.join(DATA_DIR, "votes_export.xlsx")
 RATING_XLSX_FILE = os.path.join(DATA_DIR, "rating_export.xlsx")
 # FIX #8: Ikki xil nom o'rniga bitta nom
 COMPLAINTS_DOCX_FILE = os.path.join(DATA_DIR, "complaints_export.docx")
+BACKUP_ZIP_FILE = os.path.join(DATA_DIR, "bot_backup.zip")
 
 SUBJECTS = {
     "s1": {
@@ -161,6 +163,8 @@ conn = sqlite3.connect(DB_NAME, check_same_thread=False)
 cursor = conn.cursor()
 db_lock = asyncio.Lock()
 WAITING_COMPLAINT_TEXT = set()
+COMPLAINT_COOLDOWN_SECONDS = 300
+COMPLAINT_MAX_LENGTH = 1000
 
 # Refresh tugmalarini ketma-ket bosishdan himoya
 LAST_REFRESH = {}
@@ -524,6 +528,47 @@ def save_complaint(user_id: int, full_name: str, username: str, message_text: st
     ))
     conn.commit()
 
+
+def get_last_complaint_for_user(user_id: int):
+    cursor.execute("""
+        SELECT message_text, created_at
+        FROM complaints
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (user_id,))
+    return cursor.fetchone()
+
+
+def complaint_allowed(user_id: int, message_text: str):
+    """
+    Shikoyat/taklif spam himoyasi.
+    True, '' qaytarilsa yuborish mumkin. Aks holda False va xabar matni qaytadi.
+    """
+    text = (message_text or "").strip()
+    if len(text) > COMPLAINT_MAX_LENGTH:
+        return False, f"Xabar juda uzun. Iltimos, {COMPLAINT_MAX_LENGTH} ta belgidan oshirmang."
+
+    last = get_last_complaint_for_user(user_id)
+    if not last:
+        return True, ""
+
+    last_text, created_at = last
+    if (last_text or "").strip() == text:
+        return False, "Siz aynan shu xabarni avval yuborgansiz. Iltimos, takroriy xabar yubormang."
+
+    try:
+        last_dt = datetime.strptime(created_at or "", "%Y-%m-%d %H:%M:%S").replace(tzinfo=UZ_TZ)
+        diff = (uz_now() - last_dt).total_seconds()
+        if diff < COMPLAINT_COOLDOWN_SECONDS:
+            wait_seconds = int(COMPLAINT_COOLDOWN_SECONDS - diff)
+            minutes = max(1, (wait_seconds + 59) // 60)
+            return False, f"Spamdan himoya uchun keyingi murojaatni taxminan {minutes} daqiqadan keyin yuboring."
+    except Exception:
+        pass
+
+    return True, ""
+
 # FIX #9: Optional ishlatildi
 def get_complaints_rows(limit: Optional[int] = None):
     sql = """
@@ -853,6 +898,96 @@ def get_users_text(user_id: int) -> str:
     return tr(user_id, text[:4000] + ("\n\n... qisqartirildi" if len(text) > 4000 else ""))
 
 
+def get_my_vote_text(user_id: int) -> str:
+    cursor.execute("""
+        SELECT subject_key, teacher_key, voted_at
+        FROM votes
+        WHERE user_id = ?
+    """, (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        return tr(user_id, "🧾 <b>Mening ovozim</b>\n\nSiz hali asosiy ovoz bermagansiz.")
+
+    subject_key, teacher_key, voted_at = row
+    subject_key = normalize_subject_key(subject_key)
+    return tr(
+        user_id,
+        f"🧾 <b>Mening ovozim</b>\n\n"
+        f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n"
+        f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, teacher_key)}\n"
+        f"<b>Sana:</b> {voted_at or 'Noma\'lum'}"
+    )
+
+
+def get_my_ratings_text(user_id: int) -> str:
+    cursor.execute("""
+        SELECT subject_key, teacher_key, rating, rated_at
+        FROM teacher_ratings
+        WHERE user_id = ?
+        ORDER BY rated_at DESC
+    """, (user_id,))
+    rows = cursor.fetchall()
+    if not rows:
+        return tr(user_id, "⭐️ <b>Mening baholarim</b>\n\nSiz hali o'qituvchilarga like/dislike bermagansiz.")
+
+    lines = [f"⭐️ <b>Mening baholarim</b>\n\nJami: {len(rows)} ta baho\n"]
+    for i, (subject_key, teacher_key, rating, rated_at) in enumerate(rows, start=1):
+        subject_key = normalize_subject_key(subject_key)
+        icon = "👍" if rating == "like" else "👎"
+        label = like_label(user_id) if rating == "like" else dislike_label(user_id)
+        lines.append(
+            f"{i}. <b>{get_teacher_name(subject_key, teacher_key)}</b>\n"
+            f"   Kafedra: {get_subject_name(subject_key)}\n"
+            f"   Baho: {icon} {label}\n"
+            f"   Sana: {rated_at or ''}"
+        )
+
+    text = "\n\n".join(lines)
+    return tr(user_id, text[:4000] + ("\n\n... qisqartirildi" if len(text) > 4000 else ""))
+
+
+def get_teacher_detailed_stats_text(user_id: int, subject_key: str, teacher_key: str) -> str:
+    subject_key = normalize_subject_key(subject_key)
+    if subject_key not in SUBJECTS or teacher_key not in SUBJECTS[subject_key]["teachers"]:
+        return tr(user_id, "Noto'g'ri o'qituvchi tanlandi.")
+
+    cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
+    vote_count = cursor.fetchone()[0]
+    subject_total = get_total_votes(subject_key)
+    total_votes = get_total_votes()
+    vote_percent_subject = get_vote_percent(vote_count, subject_total)
+    vote_percent_total = get_vote_percent(vote_count, total_votes)
+    like_count, dislike_count, rating_total, like_percent, dislike_percent = get_rating_counts(subject_key, teacher_key)
+
+    return tr(
+        user_id,
+        f"👤 <b>O'qituvchi statistikasi</b>\n\n"
+        f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, teacher_key)}\n"
+        f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n\n"
+        f"🗳 <b>Asosiy ovozlar:</b> {vote_count} ta\n"
+        f"📊 <b>Kafedra ichidagi ulushi:</b> {vote_percent_subject:.1f}%\n"
+        f"🌐 <b>Jami ovozlar ichidagi ulushi:</b> {vote_percent_total:.1f}%\n\n"
+        f"👍 <b>{like_label(user_id)}:</b> {like_count} ta ({like_percent:.1f}%)\n"
+        f"👎 <b>{dislike_label(user_id)}:</b> {dislike_count} ta ({dislike_percent:.1f}%)\n"
+        f"⭐️ <b>Jami baholar:</b> {rating_total} ta"
+    )
+
+
+def create_backup_zip() -> str:
+    conn.commit()
+    votes_path = export_votes_to_excel()
+    rating_path = export_rating_to_excel()
+    complaints_path = export_complaints_to_docx()
+
+    with zipfile.ZipFile(BACKUP_ZIP_FILE, "w", zipfile.ZIP_DEFLATED) as zf:
+        if os.path.exists(DB_NAME):
+            zf.write(DB_NAME, arcname="votes.db")
+        for path in (votes_path, rating_path, complaints_path):
+            if path and os.path.exists(path):
+                zf.write(path, arcname=os.path.basename(path))
+    return BACKUP_ZIP_FILE
+
+
 def get_results_text_by_scope(user_id: int, scope: str) -> str:
     scope = normalize_subject_key(scope)
     if scope == "general":
@@ -1095,6 +1230,10 @@ def home_keyboard(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=tr(user_id, "⭐️ O'qituvchilarni baholash"), callback_data="go_rating_panel")
         )
         kb.row(InlineKeyboardButton(text=tr(user_id, "📊 Natijalar"), callback_data="show_results_menu_user"))
+        kb.row(
+            InlineKeyboardButton(text=tr(user_id, "🧾 Mening ovozim"), callback_data="my_vote"),
+            InlineKeyboardButton(text=tr(user_id, "⭐️ Mening baholarim"), callback_data="my_ratings")
+        )
         kb.row(InlineKeyboardButton(text=tr(user_id, "📩 Shikoyat va takliflar"), callback_data="go_complaint_panel"))
     else:
         kb.row(InlineKeyboardButton(text=tr(user_id, "✅ Obunani tekshirish"), callback_data="check_subscription"))
@@ -1217,12 +1356,56 @@ def after_vote_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
     return kb.as_markup()
 
+
+def confirm_vote_keyboard(user_id: int, subject_key: str, teacher_key: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(
+        InlineKeyboardButton(text=tr(user_id, "✅ Tasdiqlash"), callback_data=f"confirm_vote:{subject_key}:{teacher_key}"),
+        InlineKeyboardButton(text=tr(user_id, "❌ Bekor qilish"), callback_data=f"subject:{subject_key}")
+    )
+    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ O'qituvchilar"), callback_data=f"subject:{subject_key}"))
+    kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
+    return kb.as_markup()
+
+
+def simple_back_home_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
+    return kb.as_markup()
+
+
+def teacher_stats_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for subject_key, subject_data in SUBJECTS.items():
+        kb.row(InlineKeyboardButton(text=tr(user_id, subject_data["name"]), callback_data=f"teacher_stats_subject:{subject_key}"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
+    return kb.as_markup()
+
+
+def teacher_stats_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    teachers = list(SUBJECTS[subject_key]["teachers"].items())
+    for i in range(0, len(teachers), 2):
+        row = [InlineKeyboardButton(text=tr(user_id, teacher_name), callback_data=f"teacher_stats:{subject_key}:{teacher_key}") for teacher_key, teacher_name in teachers[i:i + 2]]
+        kb.row(*row)
+    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Kafedralarga qaytish"), callback_data="admin_teacher_stats"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
+    return kb.as_markup()
+
+
+def teacher_stats_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ O'qituvchilar"), callback_data=f"teacher_stats_subject:{subject_key}"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
+    return kb.as_markup()
+
 def admin_panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text="📊 Ovoz natijalari", callback_data="admin_results"))
     kb.row(InlineKeyboardButton(text="⭐️ Baholash foizlari", callback_data="admin_rating_stats"))
     kb.row(InlineKeyboardButton(text="🏆 TOP reytinglar", callback_data="admin_top_ratings"))
     kb.row(InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users"))
+    kb.row(InlineKeyboardButton(text="👤 O'qituvchi statistikasi", callback_data="admin_teacher_stats"))
     kb.row(InlineKeyboardButton(text="📩 Shikoyat/takliflar", callback_data="admin_complaints"))
     kb.row(
         InlineKeyboardButton(text="📁 Excel ovozlar", callback_data="admin_export_votes_excel"),
@@ -1237,6 +1420,7 @@ def admin_panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🗑 Reset rating", callback_data="admin_reset_rating_confirm")
     )
     kb.row(InlineKeyboardButton(text="🧹 Shikoyatlarni tozalash", callback_data="admin_reset_complaints_confirm"))
+    kb.row(InlineKeyboardButton(text="💾 Backup", callback_data="admin_backup"))
     return kb.as_markup()
 
 def reset_confirm_keyboard(user_id: int, mode: str = "votes") -> InlineKeyboardMarkup:
@@ -1433,6 +1617,28 @@ async def help_info_handler(callback: CallbackQuery):
     await safe_edit_message(callback, get_help_text(user_id), kb.as_markup())
     await callback.answer()
 
+@dp.callback_query(F.data == "my_vote")
+async def my_vote_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not require_access_only(user_id):
+        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
+        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
+        return
+    await safe_edit_message(callback, get_my_vote_text(user_id), simple_back_home_keyboard(user_id))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "my_ratings")
+async def my_ratings_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not require_access_only(user_id):
+        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
+        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
+        return
+    await safe_edit_message(callback, get_my_ratings_text(user_id), simple_back_home_keyboard(user_id))
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "go_complaint_panel")
 async def go_complaint_panel_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -1557,10 +1763,10 @@ async def vote_handler(callback: CallbackQuery):
         await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
         return
     if not is_voting_open():
-        await callback.answer("Hozir ovoz berish yopilgan.", show_alert=True)
+        await callback.answer(tr(user_id, "Hozir ovoz berish yopilgan."), show_alert=True)
         return
     if has_voted(user_id):
-        await callback.answer("Siz faqat 1 marta ovoz bera olasiz.", show_alert=True)
+        await callback.answer(tr(user_id, "Siz faqat 1 marta ovoz bera olasiz."), show_alert=True)
         return
     parts = callback.data.split(":")
     if len(parts) != 3:
@@ -1572,7 +1778,39 @@ async def vote_handler(callback: CallbackQuery):
         await callback.answer(tr(user_id, "Noto'g'ri tanlov."), show_alert=True)
         return
 
-    # Tugma bir necha marta bosilib ketmasligi uchun inline keyboard vaqtincha olib tashlanadi.
+    text = (
+        f"❓ <b>Ovozingizni tasdiqlaysizmi?</b>\n\n"
+        f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n"
+        f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, teacher_key)}\n\n"
+        f"Tasdiqlagandan keyin asosiy ovozni qayta o'zgartirib bo'lmaydi."
+    )
+    await safe_edit_message(callback, tr(user_id, text), confirm_vote_keyboard(user_id, subject_key, teacher_key))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("confirm_vote:"))
+async def confirm_vote_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not require_access_only(user_id):
+        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
+        return
+    if not is_voting_open():
+        await callback.answer(tr(user_id, "Hozir ovoz berish yopilgan."), show_alert=True)
+        return
+    if has_voted(user_id):
+        await callback.answer(tr(user_id, "Siz faqat 1 marta ovoz bera olasiz."), show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer(tr(user_id, "Noto'g'ri tanlov."), show_alert=True)
+        return
+    _, subject_key, teacher_key = parts
+    subject_key = normalize_subject_key(subject_key)
+    if subject_key not in SUBJECTS or teacher_key not in SUBJECTS[subject_key]["teachers"]:
+        await callback.answer(tr(user_id, "Noto'g'ri tanlov."), show_alert=True)
+        return
+
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except TelegramBadRequest:
@@ -1594,11 +1832,11 @@ async def vote_handler(callback: CallbackQuery):
 
     text = (
         f"✅ <b>Ovoz muvaffaqiyatli qabul qilindi</b>\n\n"
-        f"<b>Bo'lim:</b> {SUBJECTS[subject_key]['name']}\n"
-        f"<b>Tanlovingiz:</b> {SUBJECTS[subject_key]['teachers'][teacher_key]}\n\n"
+        f"<b>Bo'lim:</b> {get_subject_name(subject_key)}\n"
+        f"<b>Tanlovingiz:</b> {get_teacher_name(subject_key, teacher_key)}\n\n"
         f"Rahmat, sizning ovozingiz saqlandi."
     )
-    await safe_edit_message(callback, text, after_vote_keyboard(user_id))
+    await safe_edit_message(callback, tr(user_id, text), after_vote_keyboard(user_id))
     await callback.answer(tr(user_id, "Ovozingiz qabul qilindi!"))
 
 # =========================
@@ -1902,6 +2140,69 @@ async def admin_top_ratings_callback(callback: CallbackQuery):
     await safe_edit_message(callback, get_top_ratings_text(user_id), kb.as_markup())
     await callback.answer()
 
+@dp.callback_query(F.data == "admin_teacher_stats")
+async def admin_teacher_stats_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    await safe_edit_message(callback, tr(user_id, "👤 <b>O'qituvchi statistikasi</b>\n\nKafedrani tanlang:"), teacher_stats_subjects_keyboard(user_id))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("teacher_stats_subject:"))
+async def teacher_stats_subject_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    subject_key = normalize_subject_key(callback.data.split(":", 1)[1])
+    if subject_key not in SUBJECTS:
+        await callback.answer(tr(user_id, "Noto'g'ri kafedra."), show_alert=True)
+        return
+    await safe_edit_message(
+        callback,
+        tr(user_id, f"👤 <b>{get_subject_name(subject_key)}</b>\n\nStatistika uchun o'qituvchini tanlang:"),
+        teacher_stats_teachers_keyboard(user_id, subject_key)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("teacher_stats:"))
+async def teacher_stats_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer(tr(user_id, "Noto'g'ri tanlov."), show_alert=True)
+        return
+    _, subject_key, teacher_key = parts
+    subject_key = normalize_subject_key(subject_key)
+    await safe_edit_message(callback, get_teacher_detailed_stats_text(user_id, subject_key, teacher_key), teacher_stats_keyboard(user_id, subject_key))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_backup")
+async def admin_backup_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    await callback.answer("Backup tayyorlanmoqda...")
+    try:
+        async with db_lock:
+            backup_path = create_backup_zip()
+        await callback.message.answer_document(
+            FSInputFile(backup_path),
+            caption="💾 Backup: votes.db, ovozlar Excel, rating Excel va shikoyatlar fayli."
+        )
+    except Exception as e:
+        logging.error(f"Backup yaratishda xatolik: {e}")
+        await callback.message.answer(f"❌ Backup yaratishda xatolik: {e}")
+
+
 @dp.callback_query(F.data == "admin_complaints")
 async def admin_complaints_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2126,6 +2427,11 @@ async def text_handler(message: Message):
         text = (message.text or "").strip()
         if not text:
             await message.answer("Bo'sh xabar qabul qilinmaydi. Iltimos, matn yozing.")
+            return
+
+        allowed, reason = complaint_allowed(user_id, text)
+        if not allowed:
+            await message.answer(tr(user_id, reason), parse_mode="HTML", reply_markup=complaint_cancel_keyboard(user_id))
             return
 
         WAITING_COMPLAINT_TEXT.discard(user_id)
