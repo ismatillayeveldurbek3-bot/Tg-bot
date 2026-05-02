@@ -1015,7 +1015,7 @@ async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup: Op
 
 def add_refresh_time(text: str) -> str:
     """Telegram edit_text 'message is not modified' xatosini oldini olish uchun millisekund qo'shadi."""
-    return text + f"  ⏱ Yangilandi: {datetime.now().strftime('%H:%M:%S')[:-3]}"
+    return text + f"  ⏱ Yangilandi: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}"
 
 
 def can_start_refresh(user_id: int, key: str) -> bool:
