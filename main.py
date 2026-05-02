@@ -37,7 +37,7 @@ except ImportError:
 # SOZLAMALAR
 # =========================
 # FIX #1: Token faqat env dan olinadi, kodga yozilmaydi
-BOT_TOKEN = os.getenv("8760253406:AAFn7DlQEUhKF4LlcAvwI0mjK4Dp_DMdsTE")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN muhit o'zgaruvchisi topilmadi. Iltimos, BOT_TOKEN ni o'rnating.")
 
