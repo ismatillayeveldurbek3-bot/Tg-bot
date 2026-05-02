@@ -154,8 +154,6 @@ OLD_TO_NEW_SUBJECT = {v["old_key"]: k for k, v in SUBJECTS.items()}
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_VERSION = "RESULT_FIXED_V1"
-
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -168,7 +166,6 @@ WAITING_COMPLAINT_TEXT = set()
 LAST_REFRESH = {}
 REFRESH_BUSY = set()
 REFRESH_COOLDOWN_SECONDS = 1.5
-RESULT_VIEW_BUSY = set()
 
 # =========================
 # LOTIN / KRILL
@@ -629,12 +626,7 @@ def get_welcome_text(user_id: int) -> str:
     )
 
 def get_home_text(user_id: int) -> str:
-    return tr(
-        user_id,
-        f"🏠 <b>Bosh menyu</b>\n\n"
-        f"Kerakli bo'limni tanlang:\n\n"
-        f"<code>{BOT_VERSION}</code>"
-    )
+    return tr(user_id, "🏠 <b>Bosh menyu</b>\n\nKerakli bo'limni tanlang:")
 
 def get_help_text(user_id: int) -> str:
     return tr(
@@ -736,23 +728,20 @@ def get_general_results_text(user_id: int) -> str:
 
 
 def get_subject_results_text(user_id: int, subject_key: str) -> str:
-    """
-    Kafedra bo'yicha natijalarni faqat shu kafedra ovozlari asosida hisoblaydi.
-    Foiz hisobida umumiy bot ovozlari emas, faqat shu kafedradagi ovozlar ishlatiladi.
-    """
     subject_key = normalize_subject_key(subject_key)
     if subject_key not in SUBJECTS:
         return tr(user_id, "Noto'g'ri kafedra.")
 
-    subject_counts = {}
-    for teacher_key in SUBJECTS[subject_key]["teachers"].keys():
-        cursor.execute("""
-            SELECT COUNT(*)
-            FROM votes
-            WHERE subject_key = ? AND teacher_key = ?
-        """, (subject_key, teacher_key))
-        subject_counts[teacher_key] = cursor.fetchone()[0]
+    cursor.execute("""
+        SELECT teacher_key, COUNT(*)
+        FROM votes
+        WHERE subject_key = ?
+        GROUP BY teacher_key
+    """, (subject_key,))
+    subject_counts = {teacher_key: count for teacher_key, count in cursor.fetchall()}
 
+    cursor.execute("SELECT COUNT(*) FROM votes")
+    total_votes = cursor.fetchone()[0]
     subject_total = sum(subject_counts.values())
 
     lines = [f"📊 <b>{get_subject_name(subject_key)} bo'yicha natijalar</b>\n"]
@@ -765,7 +754,8 @@ def get_subject_results_text(user_id: int, subject_key: str) -> str:
             f"<code>{build_progress_bar(percent)}</code>  <b>{percent:.1f}%</b>  •  {count} ta\n"
         )
 
-    lines.append(f"🗳 <b>Ushbu kafedra bo'yicha jami ovoz:</b> {subject_total}")
+    lines.append(f"🗳 <b>Ushbu kafedra ovozlari:</b> {subject_total}")
+    lines.append(f"🗳 <b>Jami ovozlar:</b> {total_votes}")
     lines.append(f"{'🟢' if is_voting_open() else '🔴'} <b>Holat:</b> {'Ochiq' if is_voting_open() else 'Yopiq'}")
 
     text = "\n".join(lines)
@@ -1024,8 +1014,9 @@ async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup: Op
 
 
 def add_refresh_time(text: str) -> str:
-    """Faqat Telegram edit_text cache muammosini oldini olish uchun marker."""
-    return text + f"\n\n⏱ Natija vaqti: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}"
+    """Telegram edit_text 'message is not modified' xatosini oldini olish uchun millisekund qo'shadi."""
+    return text + f"\\n\\n⏱ Yangilandi: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}"
+
 
 def can_start_refresh(user_id: int, key: str) -> bool:
     """
@@ -1311,38 +1302,6 @@ async def results_handler(message: Message):
     user_id = message.from_user.id
     ensure_user(user_id)
     await message.answer(get_results_menu_text(user_id, False), parse_mode="HTML", reply_markup=results_menu_keyboard_user(user_id))
-
-@dp.message(Command("check_votes"))
-async def check_votes_handler(message: Message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        await message.answer("Siz admin emassiz.")
-        return
-
-    cursor.execute("SELECT COUNT(*) FROM votes")
-    total = cursor.fetchone()[0]
-
-    cursor.execute("""
-        SELECT subject_key, teacher_key, COUNT(*)
-        FROM votes
-        GROUP BY subject_key, teacher_key
-        ORDER BY subject_key, teacher_key
-    """)
-    rows = cursor.fetchall()
-
-    lines = [f"🧾 <b>DB bo'yicha haqiqiy ovozlar</b>\n\nJami: {total} ta\n"]
-    if not rows:
-        lines.append("Hali ovoz yo'q.")
-    else:
-        for subject_key, teacher_key, count in rows:
-            subject_key = normalize_subject_key(subject_key)
-            lines.append(
-                f"• {get_subject_name(subject_key)} / {get_teacher_name(subject_key, teacher_key)}: <b>{count}</b>"
-            )
-
-    text = "\n".join(lines)
-    await message.answer(text[:4000], parse_mode="HTML")
-
 
 @dp.message(Command("debug_eshnazarova"))
 async def debug_eshnazarova_handler(message: Message):
@@ -1672,90 +1631,6 @@ async def rate_handler(callback: CallbackQuery):
     await safe_edit_message(callback, get_rate_text(user_id, subject_key, teacher_key), rate_keyboard(user_id, subject_key, teacher_key))
     await callback.answer(tr(user_id, "Bahoyingiz saqlandi!"))
 
-async def safe_show_result(callback: CallbackQuery, text: str, reply_markup: InlineKeyboardMarkup, busy_key: str):
-    """
-    Barcha natija ekranlarini bitta yangi logika orqali ko'rsatadi.
-    Ketma-ket bosishdan keladigan parallel editlarni bloklaydi.
-    """
-    user_id = callback.from_user.id
-    key = (user_id, busy_key)
-
-    if key in RESULT_VIEW_BUSY:
-        await callback.answer(tr(user_id, "Juda tez bosyapsiz. Iltimos, kuting."), show_alert=False)
-        return
-
-    RESULT_VIEW_BUSY.add(key)
-    try:
-        text = add_refresh_time(text)
-        await safe_edit_message(callback, text, reply_markup)
-        await callback.answer()
-    finally:
-        RESULT_VIEW_BUSY.discard(key)
-
-
-async def show_user_subject_result_screen(callback: CallbackQuery, scope: str):
-    user_id = callback.from_user.id
-    scope = normalize_subject_key(scope)
-
-    if scope not in SUBJECTS:
-        await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
-        return
-
-    async with db_lock:
-        text = get_subject_results_text(user_id, scope)
-
-    await safe_show_result(
-        callback=callback,
-        text=text,
-        reply_markup=results_keyboard_user(user_id, scope),
-        busy_key=f"user_results:{scope}"
-    )
-
-
-async def show_admin_result_screen(callback: CallbackQuery, scope: str):
-    user_id = callback.from_user.id
-
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-
-    scope = normalize_subject_key(scope)
-
-    if scope != "general" and scope not in SUBJECTS:
-        await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
-        return
-
-    async with db_lock:
-        text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-
-    await safe_show_result(
-        callback=callback,
-        text=text,
-        reply_markup=results_keyboard_admin(user_id, scope),
-        busy_key=f"admin_results:{scope}"
-    )
-
-
-async def show_admin_rating_screen(callback: CallbackQuery, scope: str):
-    user_id = callback.from_user.id
-
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-
-    scope = normalize_subject_key(scope)
-
-    async with db_lock:
-        text = get_rating_stats_text(user_id, scope)
-
-    await safe_show_result(
-        callback=callback,
-        text=text,
-        reply_markup=rating_stats_keyboard_admin(user_id, scope),
-        busy_key=f"admin_rating:{scope}"
-    )
-
-
 # =========================
 # USER RESULTS
 # =========================
@@ -1765,17 +1640,47 @@ async def show_results_menu_user(callback: CallbackQuery):
     await safe_edit_message(callback, get_results_menu_text(user_id, False), results_menu_keyboard_user(user_id))
     await callback.answer()
 
-
 @dp.callback_query(F.data.startswith("show_results_user:"))
 async def show_results_user(callback: CallbackQuery):
-    scope = callback.data.split(":", 1)[1].strip()
-    await show_user_subject_result_screen(callback, scope)
+    user_id = callback.from_user.id
+    scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
+
+    if scope not in SUBJECTS:
+        await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
+        return
+
+    async with db_lock:
+        text = get_subject_results_text(user_id, scope)
+        text = add_refresh_time(text)
+
+    await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("refresh_results_user:"))
 async def refresh_results_user(callback: CallbackQuery):
-    scope = callback.data.split(":", 1)[1].strip()
-    await show_user_subject_result_screen(callback, scope)
+    user_id = callback.from_user.id
+    scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
+    refresh_key = f"results_user:{scope}"
+
+    if not can_start_refresh(user_id, refresh_key):
+        await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
+        return
+
+    try:
+        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
+
+        if scope not in SUBJECTS:
+            await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
+            return
+
+        async with db_lock:
+            text = get_subject_results_text(user_id, scope)
+            text = add_refresh_time(text)
+
+        await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
+    finally:
+        finish_refresh(user_id, refresh_key)
 
 
 # =========================
@@ -1790,7 +1695,6 @@ async def back_admin_panel_callback(callback: CallbackQuery):
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer()
 
-
 @dp.callback_query(F.data == "admin_results")
 async def admin_results_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -1801,16 +1705,89 @@ async def admin_results_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "show_results_admin:general")
+async def show_results_admin_general(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    async with db_lock:
+        text = get_general_results_text(user_id)
+        text = add_refresh_time(text)
+    await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
+    await callback.answer()
+
+@dp.callback_query(F.data == "refresh_results_admin:general")
+async def refresh_results_admin_general(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    refresh_key = "results_admin:general"
+
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+
+    if not can_start_refresh(user_id, refresh_key):
+        await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
+        return
+
+    try:
+        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
+        async with db_lock:
+            text = get_general_results_text(user_id)
+            text = add_refresh_time(text)
+        await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
+    finally:
+        finish_refresh(user_id, refresh_key)
+
+
 @dp.callback_query(F.data.startswith("show_results_admin:"))
 async def show_results_admin(callback: CallbackQuery):
-    scope = callback.data.split(":", 1)[1].strip()
-    await show_admin_result_screen(callback, scope)
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+
+    scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
+    if scope != "general" and scope not in SUBJECTS:
+        await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
+        return
+
+    async with db_lock:
+        text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
+        text = add_refresh_time(text)
+
+    await safe_edit_message(callback, text, results_keyboard_admin(user_id, scope))
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("refresh_results_admin:"))
-async def refresh_results_admin(callback: CallbackQuery):
-    scope = callback.data.split(":", 1)[1].strip()
-    await show_admin_result_screen(callback, scope)
+async def refresh_results_admin_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+
+    scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
+    refresh_key = f"results_admin:{scope}"
+
+    if scope != "general" and scope not in SUBJECTS:
+        await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
+        return
+
+    if not can_start_refresh(user_id, refresh_key):
+        await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
+        return
+
+    try:
+        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
+        async with db_lock:
+            text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
+            text = add_refresh_time(text)
+
+        await safe_edit_message(callback, text, results_keyboard_admin(user_id, scope))
+    finally:
+        finish_refresh(user_id, refresh_key)
 
 
 @dp.callback_query(F.data == "admin_rating_stats")
@@ -1822,17 +1799,40 @@ async def admin_rating_stats_callback(callback: CallbackQuery):
     await safe_edit_message(callback, "⭐️ <b>Baholash foizlari</b>\n\nKerakli bo'limni tanlang:", rating_results_menu_keyboard_admin(user_id))
     await callback.answer()
 
-
 @dp.callback_query(F.data.startswith("show_rating_stats:"))
 async def show_rating_stats_callback(callback: CallbackQuery):
-    scope = callback.data.split(":", 1)[1].strip()
-    await show_admin_rating_screen(callback, scope)
-
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    scope = normalize_subject_key(callback.data.split(":", 1)[1])
+    async with db_lock:
+        text = add_refresh_time(get_rating_stats_text(user_id, scope))
+    await safe_edit_message(callback, text, rating_stats_keyboard_admin(user_id, scope))
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("refresh_rating_stats:"))
 async def refresh_rating_stats_callback(callback: CallbackQuery):
-    scope = callback.data.split(":", 1)[1].strip()
-    await show_admin_rating_screen(callback, scope)
+    user_id = callback.from_user.id
+
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+
+    scope = normalize_subject_key(callback.data.split(":", 1)[1])
+    refresh_key = f"rating_stats:{scope}"
+
+    if not can_start_refresh(user_id, refresh_key):
+        await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
+        return
+
+    try:
+        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
+        async with db_lock:
+            text = add_refresh_time(get_rating_stats_text(user_id, scope))
+        await safe_edit_message(callback, text, rating_stats_keyboard_admin(user_id, scope))
+    finally:
+        finish_refresh(user_id, refresh_key)
 
 
 @dp.callback_query(F.data == "admin_top_ratings")
@@ -1873,7 +1873,7 @@ async def refresh_admin_complaints_callback(callback: CallbackQuery):
         return
 
     try:
-        await callback.answer()
+        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
             text = add_refresh_time(get_complaints_text(user_id))
         await safe_edit_message(callback, text, complaints_keyboard_admin(user_id))
@@ -1920,7 +1920,7 @@ async def refresh_admin_users(callback: CallbackQuery):
         return
 
     try:
-        await callback.answer()
+        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
             text = add_refresh_time(get_users_text(user_id))
         await safe_edit_message(callback, text, users_keyboard_admin(user_id))
