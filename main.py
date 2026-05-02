@@ -1177,7 +1177,6 @@ def results_menu_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
 
 def rating_results_menu_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="⭐️ Umumiy rating", callback_data="show_rating_stats:general"))
     for subject_key, subject_data in SUBJECTS.items():
         kb.row(InlineKeyboardButton(text=subject_data["name"], callback_data=f"show_rating_stats:{subject_key}"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
