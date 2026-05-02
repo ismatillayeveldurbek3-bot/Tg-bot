@@ -246,6 +246,12 @@ def set_user_script(user_id: int, script: str):
 def tr(user_id: int, text: str) -> str:
     return translit_html_safe(text, get_user_script(user_id))
 
+def like_label(user_id: int) -> str:
+    return "Лайк" if get_user_script(user_id) == "cyrillic" else "Like"
+
+def dislike_label(user_id: int) -> str:
+    return "Дислайк" if get_user_script(user_id) == "cyrillic" else "Dislike"
+
 
 # =========================
 # DB
@@ -407,6 +413,10 @@ def reset_votes():
 
 def reset_ratings():
     cursor.execute("DELETE FROM teacher_ratings")
+    conn.commit()
+
+def reset_complaints():
+    cursor.execute("DELETE FROM complaints")
     conn.commit()
 
 def get_subject_name(subject_key: str) -> str:
@@ -662,7 +672,12 @@ def get_rating_teacher_text(user_id: int, subject_key: str) -> str:
 
 def get_rate_text(user_id: int, subject_key: str, teacher_key: str) -> str:
     current = get_user_teacher_rating(user_id, subject_key, teacher_key)
-    current_text = "Hozirgi bahoyingiz: " + ("👍 Like" if current == "like" else "👎 Dislike" if current == "dislike" else "hali baho berilmagan")
+    if current == "like":
+        current_text = f"Hozirgi bahoyingiz: 👍 {like_label(user_id)}"
+    elif current == "dislike":
+        current_text = f"Hozirgi bahoyingiz: 👎 {dislike_label(user_id)}"
+    else:
+        current_text = "Hozirgi bahoyingiz: hali baho berilmagan"
     like_count, dislike_count, total, like_percent, dislike_percent = get_rating_counts(subject_key, teacher_key)
     return tr(
         user_id,
@@ -670,8 +685,8 @@ def get_rate_text(user_id: int, subject_key: str, teacher_key: str) -> str:
         f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n"
         f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, teacher_key)}\n\n"
         f"{current_text}\n\n"
-        f"👍 Like: {like_count} ta ({like_percent:.1f}%)\n"
-        f"👎 Dislike: {dislike_count} ta ({dislike_percent:.1f}%)\n"
+        f"👍 {like_label(user_id)}: {like_count} ta ({like_percent:.1f}%)\n"
+        f"👎 {dislike_label(user_id)}: {dislike_count} ta ({dislike_percent:.1f}%)\n"
         f"Jami: {total} ta\n\n"
         f"Bahoni tanlang yoki o'zgartiring:"
     )
@@ -787,21 +802,21 @@ def get_rating_stats_text(user_id: int, subject_key: Optional[str] = None) -> st
 def get_top_ratings_text(user_id: int) -> str:
     rows = [r for r in rating_rows() if r["total"] > 0]
 
-    def line_items(items):
+    def line_items(items, percent_key: str, icon: str):
         if not items:
             return "Ma'lumot yo'q"
         return "\n".join([
-            f"{i}. {r['teacher_name']} — {r['subject_name']} | 👍 {r['like_percent']:.1f}% | Jami: {r['total']}"
+            f"{i}. {r['teacher_name']} — {r['subject_name']} | {icon} {r[percent_key]:.1f}% | Jami: {r['total']}"
             for i, r in enumerate(items, 1)
         ])
 
     high_like = sorted(rows, key=lambda r: (r["like_percent"], r["total"]), reverse=True)[:10]
-    low_like = sorted(rows, key=lambda r: (r["like_percent"], -r["total"]))[:10]
+    high_dislike = sorted(rows, key=lambda r: (r["dislike_percent"], r["total"]), reverse=True)[:10]
 
     text = (
         "🏆 <b>TOP reytinglar</b>\n\n"
-        "🔝 <b>TOP 10 eng baland like nisbati</b>\n" + line_items(high_like) + "\n\n"
-        "🔻 <b>TOP 10 eng past like nisbati</b>\n" + line_items(low_like)
+        "🔝 <b>TOP 10 eng baland like nisbati</b>\n" + line_items(high_like, "like_percent", "👍") + "\n\n"
+        "🔻 <b>TOP 10 eng baland dislike nisbati</b>\n" + line_items(high_dislike, "dislike_percent", "👎")
     )
     return tr(user_id, text[:4000] + ("\n\n... qisqartirildi" if len(text) > 4000 else ""))
 
@@ -1096,7 +1111,7 @@ def settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
 def subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for subject_key, subject_data in SUBJECTS.items():
-        kb.row(InlineKeyboardButton(text=subject_data["name"], callback_data=f"subject:{subject_key}"))
+        kb.row(InlineKeyboardButton(text=tr(user_id, subject_data["name"]), callback_data=f"subject:{subject_key}"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
 
@@ -1104,16 +1119,16 @@ def teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     teachers = list(SUBJECTS[subject_key]["teachers"].items())
     for i in range(0, len(teachers), 2):
-        row = [InlineKeyboardButton(text=teacher_name, callback_data=f"vote:{subject_key}:{teacher_key}") for teacher_key, teacher_name in teachers[i:i + 2]]
+        row = [InlineKeyboardButton(text=tr(user_id, teacher_name), callback_data=f"vote:{subject_key}:{teacher_key}") for teacher_key, teacher_name in teachers[i:i + 2]]
         kb.row(*row)
-    kb.row(InlineKeyboardButton(text="⬅️ Kafedralarga qaytish", callback_data="go_vote_panel"))
+    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Kafedralarga qaytish"), callback_data="go_vote_panel"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
 
 def rating_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for subject_key, subject_data in SUBJECTS.items():
-        kb.row(InlineKeyboardButton(text=subject_data["name"], callback_data=f"rating_subject:{subject_key}"))
+        kb.row(InlineKeyboardButton(text=tr(user_id, subject_data["name"]), callback_data=f"rating_subject:{subject_key}"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
 
@@ -1121,26 +1136,27 @@ def rating_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMa
     kb = InlineKeyboardBuilder()
     teachers = list(SUBJECTS[subject_key]["teachers"].items())
     for i in range(0, len(teachers), 2):
-        row = [InlineKeyboardButton(text=teacher_name, callback_data=f"rating_teacher:{subject_key}:{teacher_key}") for teacher_key, teacher_name in teachers[i:i + 2]]
+        row = [InlineKeyboardButton(text=tr(user_id, teacher_name), callback_data=f"rating_teacher:{subject_key}:{teacher_key}") for teacher_key, teacher_name in teachers[i:i + 2]]
         kb.row(*row)
-    kb.row(InlineKeyboardButton(text="⬅️ Kafedralarga qaytish", callback_data="go_rating_panel"))
+    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Kafedralarga qaytish"), callback_data="go_rating_panel"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
 
 def rate_keyboard(user_id: int, subject_key: str, teacher_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
-        InlineKeyboardButton(text="👍 Like", callback_data=f"rate:like:{subject_key}:{teacher_key}"),
-        InlineKeyboardButton(text="👎 Dislike", callback_data=f"rate:dislike:{subject_key}:{teacher_key}")
+        InlineKeyboardButton(text=f"👍 {like_label(user_id)}", callback_data=f"rate:like:{subject_key}:{teacher_key}"),
+        InlineKeyboardButton(text=f"👎 {dislike_label(user_id)}", callback_data=f"rate:dislike:{subject_key}:{teacher_key}")
     )
-    kb.row(InlineKeyboardButton(text="⬅️ O'qituvchilar", callback_data=f"rating_subject:{subject_key}"))
+    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ O'qituvchilar"), callback_data=f"rating_subject:{subject_key}"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
 
 def results_menu_keyboard_user(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text=tr(user_id, "📊 Umumiy"), callback_data="show_results_user:general"))
     for subject_key, subject_data in SUBJECTS.items():
-        kb.row(InlineKeyboardButton(text=subject_data["name"], callback_data=f"show_results_user:{subject_key}"))
+        kb.row(InlineKeyboardButton(text=tr(user_id, subject_data["name"]), callback_data=f"show_results_user:{subject_key}"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Orqaga"), callback_data="go_home"))
     return kb.as_markup()
 
@@ -1214,11 +1230,19 @@ def admin_panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="♻️ Reset ovozlar", callback_data="admin_reset_votes_confirm"),
         InlineKeyboardButton(text="🗑 Reset rating", callback_data="admin_reset_rating_confirm")
     )
+    kb.row(InlineKeyboardButton(text="🧹 Shikoyatlarni tozalash", callback_data="admin_reset_complaints_confirm"))
     return kb.as_markup()
 
 def reset_confirm_keyboard(user_id: int, mode: str = "votes") -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    yes_cb = "admin_reset_votes" if mode == "votes" else "admin_reset_rating"
+    if mode == "votes":
+        yes_cb = "admin_reset_votes"
+    elif mode == "rating":
+        yes_cb = "admin_reset_rating"
+    elif mode == "complaints":
+        yes_cb = "admin_reset_complaints"
+    else:
+        yes_cb = "admin_reset_votes"
     kb.row(
         InlineKeyboardButton(text=tr(user_id, "❌ Bekor qilish"), callback_data="cancel_reset"),
         InlineKeyboardButton(text="✅ Ha, o'chirish", callback_data=yes_cb)
@@ -1238,6 +1262,7 @@ def complaints_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="refresh_admin_complaints"),
         InlineKeyboardButton(text="📄 Word", callback_data="admin_export_complaints_docx")
     )
+    kb.row(InlineKeyboardButton(text="🧹 Tozalash", callback_data="admin_reset_complaints_confirm"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
@@ -1645,12 +1670,12 @@ async def show_results_user(callback: CallbackQuery):
     user_id = callback.from_user.id
     scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
 
-    if scope not in SUBJECTS:
+    if scope != "general" and scope not in SUBJECTS:
         await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
         return
 
     async with db_lock:
-        text = get_subject_results_text(user_id, scope)
+        text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
         text = add_refresh_time(text)
 
     await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
@@ -1670,12 +1695,12 @@ async def refresh_results_user(callback: CallbackQuery):
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
 
-        if scope not in SUBJECTS:
+        if scope != "general" and scope not in SUBJECTS:
             await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
             return
 
         async with db_lock:
-            text = get_subject_results_text(user_id, scope)
+            text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
             text = add_refresh_time(text)
 
         await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
@@ -1985,6 +2010,30 @@ async def admin_reset_rating_confirm_callback(callback: CallbackQuery):
         return
     await safe_edit_message(callback, "⚠️ <b>Diqqat!</b>\n\nBarcha rating baholari o'chiriladi.\nDavom etasizmi?", reset_confirm_keyboard(user_id, "rating"))
     await callback.answer()
+
+@dp.callback_query(F.data == "admin_reset_complaints_confirm")
+async def admin_reset_complaints_confirm_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    await safe_edit_message(
+        callback,
+        "⚠️ <b>Diqqat!</b>\n\nBarcha shikoyat va takliflar o'chiriladi.\nDavom etasizmi?",
+        reset_confirm_keyboard(user_id, "complaints")
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_reset_complaints")
+async def admin_reset_complaints_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    async with db_lock:
+        reset_complaints()
+    await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
+    await callback.answer("Shikoyat va takliflar tozalandi!")
 
 @dp.callback_query(F.data == "cancel_reset")
 async def cancel_reset_callback(callback: CallbackQuery):
