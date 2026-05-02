@@ -1651,6 +1651,7 @@ async def show_results_user(callback: CallbackQuery):
 
     async with db_lock:
         text = get_subject_results_text(user_id, scope)
+        text = add_refresh_time(text)
 
     await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
     await callback.answer()
@@ -1712,6 +1713,7 @@ async def show_results_admin_general(callback: CallbackQuery):
         return
     async with db_lock:
         text = get_general_results_text(user_id)
+        text = add_refresh_time(text)
     await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
     await callback.answer()
 
@@ -1752,6 +1754,7 @@ async def show_results_admin(callback: CallbackQuery):
 
     async with db_lock:
         text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
+        text = add_refresh_time(text)
 
     await safe_edit_message(callback, text, results_keyboard_admin(user_id, scope))
     await callback.answer()
@@ -1803,7 +1806,9 @@ async def show_rating_stats_callback(callback: CallbackQuery):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
     scope = normalize_subject_key(callback.data.split(":", 1)[1])
-    await safe_edit_message(callback, get_rating_stats_text(user_id, scope), rating_stats_keyboard_admin(user_id, scope))
+    async with db_lock:
+        text = add_refresh_time(get_rating_stats_text(user_id, scope))
+    await safe_edit_message(callback, text, rating_stats_keyboard_admin(user_id, scope))
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("refresh_rating_stats:"))
@@ -1848,7 +1853,9 @@ async def admin_complaints_callback(callback: CallbackQuery):
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-    await safe_edit_message(callback, get_complaints_text(user_id), complaints_keyboard_admin(user_id))
+    async with db_lock:
+        text = add_refresh_time(get_complaints_text(user_id))
+    await safe_edit_message(callback, text, complaints_keyboard_admin(user_id))
     await callback.answer()
 
 
@@ -1894,7 +1901,9 @@ async def admin_users_callback(callback: CallbackQuery):
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-    await safe_edit_message(callback, get_users_text(user_id), users_keyboard_admin(user_id))
+    async with db_lock:
+        text = add_refresh_time(get_users_text(user_id))
+    await safe_edit_message(callback, text, users_keyboard_admin(user_id))
     await callback.answer()
 
 @dp.callback_query(F.data == "refresh_admin_users")
