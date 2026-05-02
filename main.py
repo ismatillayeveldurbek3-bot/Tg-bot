@@ -4,7 +4,7 @@ import re
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from html import escape
 from typing import Optional
 
@@ -166,6 +166,15 @@ WAITING_COMPLAINT_TEXT = set()
 LAST_REFRESH = {}
 REFRESH_BUSY = set()
 REFRESH_COOLDOWN_SECONDS = 1.5
+
+
+# =========================
+# O'ZBEKISTON VAQTI
+# =========================
+UZ_TZ = timezone(timedelta(hours=5), name="Asia/Tashkent")
+
+def uz_now() -> datetime:
+    return datetime.now(UZ_TZ)
 
 # =========================
 # LOTIN / KRILL
@@ -392,7 +401,7 @@ def save_vote(user_id: int, full_name: str, username: str, subject_key: str, tea
             username,
             subject_key,
             teacher_key,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            uz_now().strftime("%Y-%m-%d %H:%M:%S")
         ))
         conn.commit()
         return True
@@ -453,7 +462,7 @@ def save_teacher_rating(user_id: int, full_name: str, username: str, subject_key
             username = excluded.username,
             rating = excluded.rating,
             rated_at = excluded.rated_at
-    """, (user_id, full_name, username, subject_key, teacher_key, rating, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    """, (user_id, full_name, username, subject_key, teacher_key, rating, uz_now().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
 
 # FIX #9: Optional ishlatildi
@@ -511,7 +520,7 @@ def save_complaint(user_id: int, full_name: str, username: str, message_text: st
         full_name,
         username,
         message_text,
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        uz_now().strftime("%Y-%m-%d %H:%M:%S")
     ))
     conn.commit()
 
@@ -588,7 +597,7 @@ def export_complaints_to_docx() -> str:
 
     p = doc.add_paragraph()
     p.add_run("Yaratilgan sana: ").bold = True
-    p.add_run(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    p.add_run(uz_now().strftime("%Y-%m-%d %H:%M:%S"))
 
     if not rows:
         doc.add_paragraph("Hali hech qanday shikoyat yoki taklif kelmagan.")
@@ -1030,7 +1039,7 @@ async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup: Op
 
 def add_refresh_time(text: str, user_id: int) -> str:
     """Telegram edit_text 'message is not modified' xatosini oldini olish uchun vaqt qo'shadi."""
-    return text + tr(user_id, f"  ⏱ Yangilandi: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}")
+    return text + tr(user_id, f"  ⏱ Yangilandi: {uz_now().strftime('%H:%M:%S.%f')[:-3]}")
 
 
 def can_start_refresh(user_id: int, key: str) -> bool:
@@ -1038,7 +1047,7 @@ def can_start_refresh(user_id: int, key: str) -> bool:
     Bitta user bitta bo'limda refreshni ketma-ket bosib yuborsa,
     parallel callbacklar natijani chalkashtirib yubormasligi uchun cheklaydi.
     """
-    now = datetime.now().timestamp()
+    now = uz_now().timestamp()
     refresh_key = (user_id, key)
 
     if refresh_key in REFRESH_BUSY:
