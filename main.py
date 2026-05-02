@@ -1163,7 +1163,6 @@ def rate_keyboard(user_id: int, subject_key: str, teacher_key: str) -> InlineKey
 
 def results_menu_keyboard_user(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text=tr(user_id, "📊 Umumiy"), callback_data="show_results_user:general"))
     for subject_key, subject_data in SUBJECTS.items():
         kb.row(InlineKeyboardButton(text=tr(user_id, subject_data["name"]), callback_data=f"show_results_user:{subject_key}"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Orqaga"), callback_data="go_home"))
@@ -1171,7 +1170,6 @@ def results_menu_keyboard_user(user_id: int) -> InlineKeyboardMarkup:
 
 def results_menu_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="📊 Umumiy", callback_data="show_results_admin:general"))
     for subject_key, subject_data in SUBJECTS.items():
         kb.row(InlineKeyboardButton(text=subject_data["name"], callback_data=f"show_results_admin:{subject_key}"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
@@ -1271,7 +1269,6 @@ def complaints_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="refresh_admin_complaints"),
         InlineKeyboardButton(text="📄 Word", callback_data="admin_export_complaints_docx")
     )
-    kb.row(InlineKeyboardButton(text="🧹 Tozalash", callback_data="admin_reset_complaints_confirm"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
