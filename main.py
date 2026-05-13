@@ -42,8 +42,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN muhit o'zgaruvchisi topilmadi. Iltimos, BOT_TOKEN ni o'rnating.")
 
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@QASHQADARYOPMMrasmiy")
-CHANNEL_URL = "https://t.me/QASHQADARYOPMMrasmiy"
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@Qashqadaryo_PMM")
+CHANNEL_URL = "https://t.me/Qashqadaryo_PMM"
 
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "5298063089,7361393654")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()]
