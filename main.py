@@ -3,7 +3,7 @@ import csv
 import re
 import asyncio
 import logging
-import sqlite3
+from sqlalchemy import create_engine, text
 import zipfile
 from datetime import datetime, timezone, timedelta
 from html import escape
@@ -159,8 +159,11 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-cursor = conn.cursor()
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+engine = create_engine(DATABASE_URL)
+
+conn = engine.connect()
 db_lock = asyncio.Lock()
 WAITING_COMPLAINT_TEXT = set()
 COMPLAINT_COOLDOWN_SECONDS = 300
@@ -243,7 +246,7 @@ def translit_html_safe(text: str, script: str) -> str:
 
 def get_user_script(user_id: int) -> str:
     ensure_user(user_id)
-    cursor.execute("SELECT script FROM user_prefs WHERE user_id = ?", (user_id,))
+    conn.execute(text("SELECT script FROM user_prefs WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     return row[0] if row and row[0] in ("latin", "cyrillic") else "latin"
 
@@ -252,7 +255,7 @@ def set_user_script(user_id: int, script: str):
     ensure_user(user_id)
     if script not in ("latin", "cyrillic"):
         script = "latin"
-    cursor.execute("UPDATE user_prefs SET script = ? WHERE user_id = ?", (script, user_id))
+    conn.execute(text("UPDATE user_prefs SET script = ? WHERE user_id = ?", (script, user_id))
     conn.commit()
 
 
@@ -275,7 +278,7 @@ def normalize_subject_key(subject_key: str) -> str:
     return OLD_TO_NEW_SUBJECT.get(subject_key, subject_key)
 
 def init_db():
-    cursor.execute("""
+    conn.execute(text("""
         CREATE TABLE IF NOT EXISTS votes (
             user_id INTEGER PRIMARY KEY,
             full_name TEXT,
@@ -285,20 +288,20 @@ def init_db():
             voted_at TEXT
         )
     """)
-    cursor.execute("""
+    conn.execute(text("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
     """)
-    cursor.execute("""
+    conn.execute(text("""
         CREATE TABLE IF NOT EXISTS user_prefs (
             user_id INTEGER PRIMARY KEY,
             script TEXT DEFAULT 'latin',
             access_granted INTEGER DEFAULT 0
         )
     """)
-    cursor.execute("""
+    conn.execute(text("""
         CREATE TABLE IF NOT EXISTS teacher_ratings (
             user_id INTEGER NOT NULL,
             full_name TEXT,
@@ -310,7 +313,7 @@ def init_db():
             PRIMARY KEY (user_id, subject_key, teacher_key)
         )
     """)
-    cursor.execute("""
+    conn.execute(text("""
         CREATE TABLE IF NOT EXISTS complaints (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -327,17 +330,17 @@ def init_db():
 
 def migrate_old_subject_keys():
     for old_key, new_key in OLD_TO_NEW_SUBJECT.items():
-        cursor.execute("UPDATE votes SET subject_key = ? WHERE subject_key = ?", (new_key, old_key))
-        cursor.execute("UPDATE teacher_ratings SET subject_key = ? WHERE subject_key = ?", (new_key, old_key))
+        conn.execute(text("UPDATE votes SET subject_key = ? WHERE subject_key = ?", (new_key, old_key))
+        conn.execute(text("UPDATE teacher_ratings SET subject_key = ? WHERE subject_key = ?", (new_key, old_key))
     conn.commit()
 
 def get_setting(key: str, default: str = "") -> str:
-    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    conn.execute(text("SELECT value FROM settings WHERE key = ?", (key,))
     row = cursor.fetchone()
     return row[0] if row else default
 
 def set_setting(key: str, value: str):
-    cursor.execute("""
+    conn.execute(text("""
         INSERT INTO settings (key, value)
         VALUES (?, ?)
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
@@ -345,7 +348,7 @@ def set_setting(key: str, value: str):
     conn.commit()
 
 def ensure_user(user_id: int):
-    cursor.execute("""
+    conn.execute(text("""
         INSERT INTO user_prefs (user_id, script, access_granted)
         VALUES (?, 'latin', 0)
         ON CONFLICT(user_id) DO NOTHING
@@ -354,7 +357,7 @@ def ensure_user(user_id: int):
 
 def has_access(user_id: int) -> bool:
     ensure_user(user_id)
-    cursor.execute("SELECT access_granted FROM user_prefs WHERE user_id = ?", (user_id,))
+    conn.execute(text("SELECT access_granted FROM user_prefs WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     return bool(row[0]) if row else False
 
@@ -363,12 +366,12 @@ def require_access_only(user_id: int) -> bool:
 
 def grant_access(user_id: int):
     ensure_user(user_id)
-    cursor.execute("UPDATE user_prefs SET access_granted = 1 WHERE user_id = ?", (user_id,))
+    conn.execute(text("UPDATE user_prefs SET access_granted = 1 WHERE user_id = ?", (user_id,))
     conn.commit()
 
 def reset_access(user_id: int):
     ensure_user(user_id)
-    cursor.execute("UPDATE user_prefs SET access_granted = 0 WHERE user_id = ?", (user_id,))
+    conn.execute(text("UPDATE user_prefs SET access_granted = 0 WHERE user_id = ?", (user_id,))
     conn.commit()
 
 def is_admin(user_id: int) -> bool:
@@ -384,7 +387,7 @@ def close_voting():
     set_setting("voting_open", "0")
 
 def has_voted(user_id: int) -> bool:
-    cursor.execute("SELECT 1 FROM votes WHERE user_id = ?", (user_id,))
+    conn.execute(text("SELECT 1 FROM votes WHERE user_id = ?", (user_id,))
     return cursor.fetchone() is not None
 
 def save_vote(user_id: int, full_name: str, username: str, subject_key: str, teacher_key: str) -> bool:
@@ -396,7 +399,7 @@ def save_vote(user_id: int, full_name: str, username: str, subject_key: str, tea
     subject_key = normalize_subject_key(subject_key)
 
     try:
-        cursor.execute("""
+        conn.execute(text("""
             INSERT INTO votes (user_id, full_name, username, subject_key, teacher_key, voted_at)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
@@ -415,21 +418,21 @@ def save_vote(user_id: int, full_name: str, username: str, subject_key: str, tea
 # FIX #9: str | None o'rniga Optional[str] — Python 3.9 bilan moslik
 def get_total_votes(subject_key: Optional[str] = None) -> int:
     if subject_key:
-        cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ?", (normalize_subject_key(subject_key),))
+        conn.execute(text("SELECT COUNT(*) FROM votes WHERE subject_key = ?", (normalize_subject_key(subject_key),))
     else:
-        cursor.execute("SELECT COUNT(*) FROM votes")
+        conn.execute(text("SELECT COUNT(*) FROM votes")
     return cursor.fetchone()[0]
 
 def reset_votes():
-    cursor.execute("DELETE FROM votes")
+    conn.execute(text("DELETE FROM votes")
     conn.commit()
 
 def reset_ratings():
-    cursor.execute("DELETE FROM teacher_ratings")
+    conn.execute(text("DELETE FROM teacher_ratings")
     conn.commit()
 
 def reset_complaints():
-    cursor.execute("DELETE FROM complaints")
+    conn.execute(text("DELETE FROM complaints")
     conn.commit()
 
 def get_subject_name(subject_key: str) -> str:
@@ -457,7 +460,7 @@ def get_all_teachers_flat():
 # =========================
 def save_teacher_rating(user_id: int, full_name: str, username: str, subject_key: str, teacher_key: str, rating: str):
     subject_key = normalize_subject_key(subject_key)
-    cursor.execute("""
+    conn.execute(text("""
         INSERT INTO teacher_ratings (user_id, full_name, username, subject_key, teacher_key, rating, rated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, subject_key, teacher_key)
@@ -471,7 +474,7 @@ def save_teacher_rating(user_id: int, full_name: str, username: str, subject_key
 
 # FIX #9: Optional ishlatildi
 def get_user_teacher_rating(user_id: int, subject_key: str, teacher_key: str) -> Optional[str]:
-    cursor.execute("""
+    conn.execute(text("""
         SELECT rating FROM teacher_ratings
         WHERE user_id = ? AND subject_key = ? AND teacher_key = ?
     """, (user_id, normalize_subject_key(subject_key), teacher_key))
@@ -479,7 +482,7 @@ def get_user_teacher_rating(user_id: int, subject_key: str, teacher_key: str) ->
     return row[0] if row else None
 
 def get_rating_counts(subject_key: str, teacher_key: str):
-    cursor.execute("""
+    conn.execute(text("""
         SELECT
             SUM(CASE WHEN rating = 'like' THEN 1 ELSE 0 END),
             SUM(CASE WHEN rating = 'dislike' THEN 1 ELSE 0 END),
@@ -516,7 +519,7 @@ def get_vote_percent(count: int, denominator: int) -> float:
     return (count / denominator * 100) if denominator > 0 else 0.0
 
 def save_complaint(user_id: int, full_name: str, username: str, message_text: str):
-    cursor.execute("""
+    conn.execute(text("""
         INSERT INTO complaints (user_id, full_name, username, message_text, created_at)
         VALUES (?, ?, ?, ?, ?)
     """, (
@@ -530,7 +533,7 @@ def save_complaint(user_id: int, full_name: str, username: str, message_text: st
 
 
 def get_last_complaint_for_user(user_id: int):
-    cursor.execute("""
+    conn.execute(text("""
         SELECT message_text, created_at
         FROM complaints
         WHERE user_id = ?
@@ -580,12 +583,12 @@ def get_complaints_rows(limit: Optional[int] = None):
     if limit:
         sql += " LIMIT ?"
         params = (limit,)
-    cursor.execute(sql, params)
+    conn.execute(text(sql, params)
     return cursor.fetchall()
 
 
 def get_complaints_count() -> int:
-    cursor.execute("SELECT COUNT(*) FROM complaints")
+    conn.execute(text("SELECT COUNT(*) FROM complaints")
     return cursor.fetchone()[0]
 
 
@@ -767,7 +770,7 @@ def get_admin_panel_text(user_id: int) -> str:
     return tr(user_id, f"🎛 <b>Admin panel</b>\n\nVoting holati: {status_text}\nJami ovozlar: {get_total_votes()}")
 
 def get_general_results_text(user_id: int) -> str:
-    cursor.execute("""
+    conn.execute(text("""
         SELECT subject_key, teacher_key, COUNT(*)
         FROM votes
         GROUP BY subject_key, teacher_key
@@ -801,7 +804,7 @@ def get_subject_results_text(user_id: int, subject_key: str) -> str:
     if subject_key not in SUBJECTS:
         return tr(user_id, "Noto'g'ri kafedra.")
 
-    cursor.execute("""
+    conn.execute(text("""
         SELECT teacher_key, COUNT(*)
         FROM votes
         WHERE subject_key = ?
@@ -809,7 +812,7 @@ def get_subject_results_text(user_id: int, subject_key: str) -> str:
     """, (subject_key,))
     subject_counts = {teacher_key: count for teacher_key, count in cursor.fetchall()}
 
-    cursor.execute("SELECT COUNT(*) FROM votes")
+    conn.execute(text("SELECT COUNT(*) FROM votes")
     total_votes = cursor.fetchone()[0]
     subject_total = sum(subject_counts.values())
 
@@ -876,7 +879,7 @@ def get_top_ratings_text(user_id: int) -> str:
 
 
 def get_users_text(user_id: int) -> str:
-    cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
+    conn.execute(text("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
     rows = cursor.fetchall()
     if not rows:
         return tr(user_id, "👥 Hali hech kim ovoz bermagan.")
@@ -899,7 +902,7 @@ def get_users_text(user_id: int) -> str:
 
 
 def get_my_vote_text(user_id: int) -> str:
-    cursor.execute("""
+    conn.execute(text("""
         SELECT subject_key, teacher_key, voted_at
         FROM votes
         WHERE user_id = ?
@@ -920,7 +923,7 @@ def get_my_vote_text(user_id: int) -> str:
 
 
 def get_my_ratings_text(user_id: int) -> str:
-    cursor.execute("""
+    conn.execute(text("""
         SELECT subject_key, teacher_key, rating, rated_at
         FROM teacher_ratings
         WHERE user_id = ?
@@ -951,7 +954,7 @@ def get_teacher_detailed_stats_text(user_id: int, subject_key: str, teacher_key:
     if subject_key not in SUBJECTS or teacher_key not in SUBJECTS[subject_key]["teachers"]:
         return tr(user_id, "Noto'g'ri o'qituvchi tanlandi.")
 
-    cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
+    conn.execute(text("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
     vote_count = cursor.fetchone()[0]
     subject_total = get_total_votes(subject_key)
     total_votes = get_total_votes()
@@ -1000,7 +1003,7 @@ def get_results_text_by_scope(user_id: int, scope: str) -> str:
 # EXPORT
 # =========================
 def export_votes_to_csv() -> str:
-    cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
+    conn.execute(text("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
     rows = cursor.fetchall()
     with open(EXPORT_FILE, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
@@ -1023,7 +1026,7 @@ def export_votes_to_excel() -> str:
 
     ws = wb.create_sheet("Umumiy ovozlar")
     ws_append_header(ws, ["User ID", "Full Name", "Username", "Kafedra", "O'qituvchi", "Voted At"])
-    cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
+    conn.execute(text("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
     for user_id, full_name, username, subject_key, teacher_key, voted_at in cursor.fetchall():
         subject_key = normalize_subject_key(subject_key)
         ws.append([user_id, full_name or "", username or "", get_subject_name(subject_key), get_teacher_name(subject_key, teacher_key), voted_at or ""])
@@ -1031,7 +1034,7 @@ def export_votes_to_excel() -> str:
     for subject_key, subject_data in SUBJECTS.items():
         ws = wb.create_sheet(subject_data["name"][:31])
         ws_append_header(ws, ["User ID", "Full Name", "Username", "O'qituvchi", "Voted At"])
-        cursor.execute("SELECT user_id, full_name, username, teacher_key, voted_at FROM votes WHERE subject_key = ? ORDER BY voted_at DESC", (subject_key,))
+        conn.execute(text("SELECT user_id, full_name, username, teacher_key, voted_at FROM votes WHERE subject_key = ? ORDER BY voted_at DESC", (subject_key,))
         for user_id, full_name, username, teacher_key, voted_at in cursor.fetchall():
             ws.append([user_id, full_name or "", username or "", get_teacher_name(subject_key, teacher_key), voted_at or ""])
 
@@ -1039,7 +1042,7 @@ def export_votes_to_excel() -> str:
     ws_append_header(ws, ["Kafedra", "O'qituvchi", "Ovozlar", "Foiz"])
     total = get_total_votes()
     for subject_key, teacher_key, teacher_name in get_all_teachers_flat():
-        cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
+        conn.execute(text("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
         count = cursor.fetchone()[0]
         ws.append([get_subject_name(subject_key), teacher_name, count, round((count / total * 100) if total else 0, 2)])
 
@@ -1048,7 +1051,7 @@ def export_votes_to_excel() -> str:
         ws_append_header(ws, ["O'qituvchi", "Ovozlar", "Kafedra ichidagi foiz"])
         subject_total = get_total_votes(subject_key)
         for teacher_key, teacher_name in subject_data["teachers"].items():
-            cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
+            conn.execute(text("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
             count = cursor.fetchone()[0]
             ws.append([teacher_name, count, round((count / subject_total * 100) if subject_total else 0, 2)])
 
@@ -1081,7 +1084,7 @@ def export_rating_to_excel() -> str:
 
     ws = wb.create_sheet("Umumiy ovozlar")
     ws_append_header(ws, ["User ID", "Full Name", "Username", "Kafedra", "O'qituvchi", "Rating", "Rated At"])
-    cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, rating, rated_at FROM teacher_ratings ORDER BY rated_at DESC")
+    conn.execute(text("SELECT user_id, full_name, username, subject_key, teacher_key, rating, rated_at FROM teacher_ratings ORDER BY rated_at DESC")
     for user_id, full_name, username, subject_key, teacher_key, rating, rated_at in cursor.fetchall():
         subject_key = normalize_subject_key(subject_key)
         ws.append([user_id, full_name or "", username or "", get_subject_name(subject_key), get_teacher_name(subject_key, teacher_key), rating, rated_at or ""])
@@ -1091,7 +1094,7 @@ def export_rating_to_excel() -> str:
 
 
 def export_complaints_to_word() -> str:
-    cursor.execute("""
+    conn.execute(text("""
         SELECT user_id, full_name, username, message_text, created_at
         FROM complaints
         ORDER BY created_at DESC
@@ -1489,7 +1492,7 @@ async def my_access_handler(message: Message):
     ensure_user(user_id)
     if not is_admin(user_id):
         return
-    cursor.execute("SELECT access_granted FROM user_prefs WHERE user_id = ?", (user_id,))
+    conn.execute(text("SELECT access_granted FROM user_prefs WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
     # FIX #3: apostrof xatosi tuzatildi
     val = row[0] if row else "yo'q"
@@ -1523,7 +1526,7 @@ async def debug_eshnazarova_handler(message: Message):
     if not is_admin(user_id):
         return
 
-    cursor.execute("""
+    conn.execute(text("""
         SELECT user_id, full_name, username, subject_key, teacher_key, voted_at
         FROM votes
         WHERE teacher_key = 'aif_10'
