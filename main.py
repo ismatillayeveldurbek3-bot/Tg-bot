@@ -71,7 +71,7 @@ VOTES_XLSX_FILE = os.path.join(DATA_DIR, "votes_export.xlsx")
 RATING_XLSX_FILE = os.path.join(DATA_DIR, "rating_export.xlsx")
 COMPLAINTS_DOCX_FILE = os.path.join(DATA_DIR, "complaints_export.docx")
 BACKUP_ZIP_FILE = os.path.join(DATA_DIR, "bot_backup.zip")
-DB_NAME = os.path.join(DATA_DIR, "votes.db")  # backup ZIP uchun saqlanadi
+DB_NAME = os.path.join(DATA_DIR, "votes.db")
 
 # =========================
 # DATABASE (SQLAlchemy + PostgreSQL)
@@ -90,13 +90,21 @@ if not DATABASE_URL:
 
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,       # ulanish uzilganini avtomatik aniqlaydi
-    pool_recycle=300,         # 5 daqiqada bir ulanishni yangilaydi
+    pool_pre_ping=True,
+    pool_recycle=300,
     pool_size=5,
     max_overflow=10,
     echo=False,
 )
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+# expire_on_commit=False: commit() dan keyin ORM obyektlari expired bo'lmaydi,
+# session.close() dan keyin ham attribute access ishlaydi
+SessionLocal = sessionmaker(
+    bind=engine,
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+)
 Base = declarative_base()
 
 # =========================
@@ -155,7 +163,12 @@ class Complaint(Base):
 # =========================
 @contextmanager
 def get_db():
-    """Context manager: session olib, commit/rollback/close qiladi."""
+    """
+    Production-ready context manager.
+    - expire_on_commit=False => commit() dan keyin obyektlar expired bo'lmaydi
+    - Har doim commit/rollback/close to'g'ri tartibda chaqiriladi
+    - Session hech qachon tashqariga "chiqmaydi" — faqat context ichida ishlaydi
+    """
     db: Session = SessionLocal()
     try:
         yield db
@@ -348,7 +361,8 @@ def get_user_script(user_id: int) -> str:
     ensure_user(user_id)
     with get_db() as db:
         row = db.query(UserPref).filter(UserPref.user_id == user_id).first()
-    return row.script if row and row.script in ("latin", "cyrillic") else "latin"
+        # Return ichkariga ko'chirildi — session yopilmasdan oldin
+        return row.script if row and row.script in ("latin", "cyrillic") else "latin"
 
 
 def set_user_script(user_id: int, script: str):
@@ -403,7 +417,8 @@ def migrate_old_subject_keys():
 def get_setting(key: str, default: str = "") -> str:
     with get_db() as db:
         row = db.query(Setting).filter(Setting.key == key).first()
-    return row.value if row else default
+        # Session ichida return
+        return row.value if row else default
 
 
 def set_setting(key: str, value: str):
@@ -426,7 +441,8 @@ def has_access(user_id: int) -> bool:
     ensure_user(user_id)
     with get_db() as db:
         row = db.query(UserPref).filter(UserPref.user_id == user_id).first()
-    return bool(row.access_granted) if row else False
+        # Session ichida return
+        return bool(row.access_granted) if row else False
 
 
 def require_access_only(user_id: int) -> bool:
@@ -577,7 +593,8 @@ def get_user_teacher_rating(
             TeacherRating.subject_key == normalize_subject_key(subject_key),
             TeacherRating.teacher_key == teacher_key,
         ).first()
-    return row.rating if row else None
+        # Session ichida return — DetachedInstanceError yo'q
+        return row.rating if row else None
 
 
 def get_rating_counts(subject_key: str, teacher_key: str):
@@ -587,8 +604,9 @@ def get_rating_counts(subject_key: str, teacher_key: str):
             TeacherRating.subject_key == subject_key,
             TeacherRating.teacher_key == teacher_key,
         ).all()
-    total = len(rows)
-    like_count = sum(1 for r in rows if r.rating == "like")
+        # Session ichida hamma qiymatlarni o'qib olamiz
+        total = len(rows)
+        like_count = sum(1 for r in rows if r.rating == "like")
     dislike_count = total - like_count
     like_percent = (like_count / total * 100) if total else 0
     dislike_percent = (dislike_count / total * 100) if total else 0
@@ -638,8 +656,9 @@ def get_last_complaint_for_user(user_id: int):
             .order_by(Complaint.id.desc())
             .first()
         )
-    if row:
-        return row.message_text, row.created_at
+        # Session ichida qiymatlarni olamiz
+        if row:
+            return row.message_text, row.created_at
     return None
 
 
@@ -675,10 +694,11 @@ def get_complaints_rows(limit: Optional[int] = None):
         if limit:
             q = q.limit(limit)
         rows = q.all()
-    return [
-        (r.id, r.user_id, r.full_name, r.username, r.message_text, r.created_at)
-        for r in rows
-    ]
+        # Session ichida tuple listga aylantirish — DetachedInstanceError yo'q
+        return [
+            (r.id, r.user_id, r.full_name, r.username, r.message_text, r.created_at)
+            for r in rows
+        ]
 
 
 def get_complaints_count() -> int:
@@ -863,12 +883,15 @@ def get_admin_panel_text(user_id: int) -> str:
     return tr(user_id, f"🎛 <b>Admin panel</b>\n\nVoting holati: {status_text}\nJami ovozlar: {get_total_votes()}")
 
 def get_general_results_text(user_id: int) -> str:
+    # Session ichida barcha qiymatlarni olamiz
     with get_db() as db:
         all_votes = db.query(Vote).all()
+        # Tuple listiga aylantiramiz — session yopilmasdan oldin
+        vote_data = [(normalize_subject_key(v.subject_key), v.teacher_key) for v in all_votes]
 
     counts = {}
-    for v in all_votes:
-        key = (normalize_subject_key(v.subject_key), v.teacher_key)
+    for subject_key, teacher_key in vote_data:
+        key = (subject_key, teacher_key)
         counts[key] = counts.get(key, 0) + 1
 
     total_votes = sum(counts.values())
@@ -897,16 +920,15 @@ def get_subject_results_text(user_id: int, subject_key: str) -> str:
         return tr(user_id, "Noto'g'ri kafedra.")
 
     with get_db() as db:
-        subject_votes = (
-            db.query(Vote)
-            .filter(Vote.subject_key == subject_key)
-            .all()
-        )
+        subject_votes_data = [
+            v.teacher_key for v in
+            db.query(Vote).filter(Vote.subject_key == subject_key).all()
+        ]
         total_votes = db.query(Vote).count()
 
     subject_counts = {}
-    for v in subject_votes:
-        subject_counts[v.teacher_key] = subject_counts.get(v.teacher_key, 0) + 1
+    for teacher_key in subject_votes_data:
+        subject_counts[teacher_key] = subject_counts.get(teacher_key, 0) + 1
 
     subject_total = sum(subject_counts.values())
     lines = [f"📊 <b>{get_subject_name(subject_key)} bo'yicha natijalar</b>\n"]
@@ -973,23 +995,27 @@ def get_top_ratings_text(user_id: int) -> str:
 
 def get_users_text(user_id: int) -> str:
     with get_db() as db:
-        rows = db.query(Vote).order_by(Vote.voted_at.desc()).all()
+        # Session ichida barcha kerakli fieldlarni tuple listiga olamiz
+        rows = [
+            (v.user_id, v.full_name, v.username, v.subject_key, v.teacher_key, v.voted_at)
+            for v in db.query(Vote).order_by(Vote.voted_at.desc()).all()
+        ]
 
     if not rows:
         return tr(user_id, "👥 Hali hech kim ovoz bermagan.")
 
     lines = [f"👥 <b>Kim kimga ovoz berdi</b>\n\nJami: {len(rows)} ta foydalanuvchi\n"]
-    for i, v in enumerate(rows, start=1):
-        subject_key = normalize_subject_key(v.subject_key)
-        name = v.full_name or "Noma'lum"
+    for i, (vid, full_name, username, subject_key, teacher_key, voted_at) in enumerate(rows, start=1):
+        subject_key = normalize_subject_key(subject_key)
+        name = full_name or "Noma'lum"
         line = f"{i}. <b>{name}</b>"
-        if v.username:
-            line += f" (@{v.username})"
+        if username:
+            line += f" (@{username})"
         line += f"\n   → Kafedra: {get_subject_name(subject_key)}"
-        line += f"\n   → O'qituvchi: {get_teacher_name(subject_key, v.teacher_key)}"
-        line += f"\n   → ID: <code>{v.user_id}</code>"
-        if v.voted_at:
-            line += f"\n   → {v.voted_at}"
+        line += f"\n   → O'qituvchi: {get_teacher_name(subject_key, teacher_key)}"
+        line += f"\n   → ID: <code>{vid}</code>"
+        if voted_at:
+            line += f"\n   → {voted_at}"
         lines.append(line)
 
     text = "\n\n".join(lines)
@@ -999,42 +1025,44 @@ def get_users_text(user_id: int) -> str:
 def get_my_vote_text(user_id: int) -> str:
     with get_db() as db:
         row = db.query(Vote).filter(Vote.user_id == user_id).first()
+        if not row:
+            return tr(user_id, "🧾 <b>Mening ovozim</b>\n\nSiz hali asosiy ovoz bermagansiz.")
+        # Session ichida qiymatlarni olamiz
+        subject_key = normalize_subject_key(row.subject_key)
+        teacher_key = row.teacher_key
+        voted_at = row.voted_at
 
-    if not row:
-        return tr(user_id, "🧾 <b>Mening ovozim</b>\n\nSiz hali asosiy ovoz bermagansiz.")
-
-    subject_key = normalize_subject_key(row.subject_key)
     return tr(
         user_id,
         f"🧾 <b>Mening ovozim</b>\n\n"
         f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n"
-        f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, row.teacher_key)}\n"
-        f"<b>Sana:</b> {row.voted_at or 'Nomalum'}"
+        f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, teacher_key)}\n"
+        f"<b>Sana:</b> {voted_at or 'Nomalum'}"
     )
 
 
 def get_my_ratings_text(user_id: int) -> str:
     with get_db() as db:
-        rows = (
-            db.query(TeacherRating)
+        rows = [
+            (normalize_subject_key(r.subject_key), r.teacher_key, r.rating, r.rated_at)
+            for r in db.query(TeacherRating)
             .filter(TeacherRating.user_id == user_id)
             .order_by(TeacherRating.rated_at.desc())
             .all()
-        )
+        ]
 
     if not rows:
         return tr(user_id, "⭐️ <b>Mening baholarim</b>\n\nSiz hali o'qituvchilarga like/dislike bermagansiz.")
 
     lines = [f"⭐️ <b>Mening baholarim</b>\n\nJami: {len(rows)} ta baho\n"]
-    for i, r in enumerate(rows, start=1):
-        subject_key = normalize_subject_key(r.subject_key)
-        icon = "👍" if r.rating == "like" else "👎"
-        label = like_label(user_id) if r.rating == "like" else dislike_label(user_id)
+    for i, (subject_key, teacher_key, rating, rated_at) in enumerate(rows, start=1):
+        icon = "👍" if rating == "like" else "👎"
+        label = like_label(user_id) if rating == "like" else dislike_label(user_id)
         lines.append(
-            f"{i}. <b>{get_teacher_name(subject_key, r.teacher_key)}</b>\n"
+            f"{i}. <b>{get_teacher_name(subject_key, teacher_key)}</b>\n"
             f"   Kafedra: {get_subject_name(subject_key)}\n"
             f"   Baho: {icon} {label}\n"
-            f"   Sana: {r.rated_at or ''}"
+            f"   Sana: {rated_at or ''}"
         )
 
     text = "\n\n".join(lines)
@@ -1098,16 +1126,19 @@ def get_results_text_by_scope(user_id: int, scope: str) -> str:
 # =========================
 def export_votes_to_csv() -> str:
     with get_db() as db:
-        rows = db.query(Vote).order_by(Vote.voted_at.desc()).all()
+        rows = [
+            (v.user_id, v.full_name, v.username, v.subject_key, v.teacher_key, v.voted_at)
+            for v in db.query(Vote).order_by(Vote.voted_at.desc()).all()
+        ]
 
     with open(EXPORT_FILE, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["User ID", "Full Name", "Username", "Subject", "Teacher", "Voted At"])
-        for v in rows:
-            sk = normalize_subject_key(v.subject_key)
+        for (uid, full_name, username, subject_key, teacher_key, voted_at) in rows:
+            sk = normalize_subject_key(subject_key)
             writer.writerow([
-                v.user_id, v.full_name or "", v.username or "",
-                get_subject_name(sk), get_teacher_name(sk, v.teacher_key), v.voted_at or ""
+                uid, full_name or "", username or "",
+                get_subject_name(sk), get_teacher_name(sk, teacher_key), voted_at or ""
             ])
     return EXPORT_FILE
 
@@ -1123,28 +1154,31 @@ def export_votes_to_excel() -> str:
         return export_votes_to_csv()
 
     with get_db() as db:
-        all_votes = db.query(Vote).order_by(Vote.voted_at.desc()).all()
+        all_votes = [
+            (v.user_id, v.full_name, v.username, v.subject_key, v.teacher_key, v.voted_at)
+            for v in db.query(Vote).order_by(Vote.voted_at.desc()).all()
+        ]
 
     wb = Workbook()
     wb.remove(wb.active)
 
     ws = wb.create_sheet("Umumiy ovozlar")
     ws_append_header(ws, ["User ID", "Full Name", "Username", "Kafedra", "O'qituvchi", "Voted At"])
-    for v in all_votes:
-        sk = normalize_subject_key(v.subject_key)
+    for (uid, full_name, username, subject_key, teacher_key, voted_at) in all_votes:
+        sk = normalize_subject_key(subject_key)
         ws.append([
-            v.user_id, v.full_name or "", v.username or "",
-            get_subject_name(sk), get_teacher_name(sk, v.teacher_key), v.voted_at or ""
+            uid, full_name or "", username or "",
+            get_subject_name(sk), get_teacher_name(sk, teacher_key), voted_at or ""
         ])
 
     for subject_key, subject_data in SUBJECTS.items():
         ws = wb.create_sheet(subject_data["name"][:31])
         ws_append_header(ws, ["User ID", "Full Name", "Username", "O'qituvchi", "Voted At"])
-        subject_votes = [v for v in all_votes if normalize_subject_key(v.subject_key) == subject_key]
-        for v in subject_votes:
+        subject_votes = [v for v in all_votes if normalize_subject_key(v[3]) == subject_key]
+        for (uid, full_name, username, sk_raw, teacher_key, voted_at) in subject_votes:
             ws.append([
-                v.user_id, v.full_name or "", v.username or "",
-                get_teacher_name(subject_key, v.teacher_key), v.voted_at or ""
+                uid, full_name or "", username or "",
+                get_teacher_name(subject_key, teacher_key), voted_at or ""
             ])
 
     ws = wb.create_sheet("Umumiy natija")
@@ -1153,7 +1187,7 @@ def export_votes_to_excel() -> str:
     for subject_key, teacher_key, teacher_name in get_all_teachers_flat():
         count = sum(
             1 for v in all_votes
-            if normalize_subject_key(v.subject_key) == subject_key and v.teacher_key == teacher_key
+            if normalize_subject_key(v[3]) == subject_key and v[4] == teacher_key
         )
         ws.append([
             get_subject_name(subject_key), teacher_name,
@@ -1163,10 +1197,10 @@ def export_votes_to_excel() -> str:
     for subject_key, subject_data in SUBJECTS.items():
         ws = wb.create_sheet((subject_data["name"][:24] + " natija")[:31])
         ws_append_header(ws, ["O'qituvchi", "Ovozlar", "Kafedra ichidagi foiz"])
-        subject_votes = [v for v in all_votes if normalize_subject_key(v.subject_key) == subject_key]
+        subject_votes = [v for v in all_votes if normalize_subject_key(v[3]) == subject_key]
         subject_total = len(subject_votes)
         for teacher_key, teacher_name in subject_data["teachers"].items():
-            count = sum(1 for v in subject_votes if v.teacher_key == teacher_key)
+            count = sum(1 for v in subject_votes if v[4] == teacher_key)
             ws.append([
                 teacher_name, count,
                 round((count / subject_total * 100) if subject_total else 0, 2)
@@ -1212,16 +1246,19 @@ def export_rating_to_excel() -> str:
             ])
 
     with get_db() as db:
-        all_ratings = db.query(TeacherRating).order_by(TeacherRating.rated_at.desc()).all()
+        all_ratings = [
+            (r.user_id, r.full_name, r.username, r.subject_key, r.teacher_key, r.rating, r.rated_at)
+            for r in db.query(TeacherRating).order_by(TeacherRating.rated_at.desc()).all()
+        ]
 
     ws = wb.create_sheet("Umumiy ovozlar")
     ws_append_header(ws, ["User ID", "Full Name", "Username", "Kafedra", "O'qituvchi", "Rating", "Rated At"])
-    for r in all_ratings:
-        sk = normalize_subject_key(r.subject_key)
+    for (uid, full_name, username, subject_key, teacher_key, rating, rated_at) in all_ratings:
+        sk = normalize_subject_key(subject_key)
         ws.append([
-            r.user_id, r.full_name or "", r.username or "",
-            get_subject_name(sk), get_teacher_name(sk, r.teacher_key),
-            r.rating, r.rated_at or ""
+            uid, full_name or "", username or "",
+            get_subject_name(sk), get_teacher_name(sk, teacher_key),
+            rating, rated_at or ""
         ])
 
     wb.save(RATING_XLSX_FILE)
@@ -1582,7 +1619,7 @@ async def my_access_handler(message: Message):
         return
     with get_db() as db:
         row = db.query(UserPref).filter(UserPref.user_id == user_id).first()
-    val = row.access_granted if row else "yo'q"
+        val = row.access_granted if row else "yo'q"
     await message.answer(f"access_granted: {val}")
 
 
@@ -1619,13 +1656,16 @@ async def debug_eshnazarova_handler(message: Message):
     if not is_admin(user_id):
         return
     with get_db() as db:
-        rows = db.query(Vote).filter(Vote.teacher_key == "aif_10").order_by(Vote.voted_at.desc()).all()
+        rows = [
+            (v.user_id, v.full_name, v.username, v.subject_key, v.teacher_key, v.voted_at)
+            for v in db.query(Vote).filter(Vote.teacher_key == "aif_10").order_by(Vote.voted_at.desc()).all()
+        ]
     if not rows:
         await message.answer("Eshnazarova Maziya Allanazarovna uchun bazada ovoz yo'q.")
         return
     lines = ["Eshnazarova Maziya Allanazarovna uchun bazadagi ovozlar:"]
-    for v in rows:
-        lines.append(f"ID: {v.user_id} | {v.full_name or ''} | @{v.username or ''} | {v.subject_key}/{v.teacher_key} | {v.voted_at}")
+    for (vid, full_name, username, subject_key, teacher_key, voted_at) in rows:
+        lines.append(f"ID: {vid} | {full_name or ''} | @{username or ''} | {subject_key}/{teacher_key} | {voted_at}")
     await message.answer("\n".join(lines[:50]))
 
 
