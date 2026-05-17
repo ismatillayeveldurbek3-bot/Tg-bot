@@ -1,5 +1,5 @@
-aiogram
-openpyxl
-python-docx
-psycopg2-binary
-sqlalchemy
+aiogram==3.4.1
+SQLAlchemy==2.0.25
+psycopg2-binary==2.9.9
+openpyxl==3.1.2
+python-docx==1.1.0
