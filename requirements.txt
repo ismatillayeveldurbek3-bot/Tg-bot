@@ -1,5 +1,4 @@
 aiogram
 openpyxl
 python-docx
-psycopg2-binary
-sqlalchemy
+
