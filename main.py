@@ -1009,7 +1009,7 @@ def get_my_vote_text(user_id: int) -> str:
         f"🧾 <b>Mening ovozim</b>\n\n"
         f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n"
         f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, row.teacher_key)}\n"
-        f"<b>Sana:</b> {row.voted_at or 'Noma\\'lum'}"
+        f"<b>Sana:</b> {row.voted_at or 'Nomalum'}"
     )
 
 
