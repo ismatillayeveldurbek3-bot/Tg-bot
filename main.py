@@ -3,8 +3,8 @@ import csv
 import re
 import asyncio
 import logging
-from sqlalchemy import create_engine, text
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from html import escape
 from typing import Optional
@@ -22,6 +22,19 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+# SQLAlchemy
+from sqlalchemy import (
+    create_engine,
+    text,
+    Column,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy.exc import IntegrityError
+
 try:
     from openpyxl import Workbook
 except ImportError:
@@ -37,10 +50,9 @@ except ImportError:
 # =========================
 # SOZLAMALAR
 # =========================
-# FIX #1: Token faqat env dan olinadi, kodga yozilmaydi
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN muhit o'zgaruvchisi topilmadi. Iltimos, BOT_TOKEN ni o'rnating.")
+    raise ValueError("BOT_TOKEN muhit o'zgaruvchisi topilmadi.")
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@Qashqadaryo_PMM")
 CHANNEL_URL = "https://t.me/Qashqadaryo_PMM"
@@ -54,14 +66,110 @@ INSTAGRAM_URL = "https://www.instagram.com/pedagogikmahorat"
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-DB_NAME = os.path.join(DATA_DIR, "votes.db")
 EXPORT_FILE = os.path.join(DATA_DIR, "votes_export.csv")
 VOTES_XLSX_FILE = os.path.join(DATA_DIR, "votes_export.xlsx")
 RATING_XLSX_FILE = os.path.join(DATA_DIR, "rating_export.xlsx")
-# FIX #8: Ikki xil nom o'rniga bitta nom
 COMPLAINTS_DOCX_FILE = os.path.join(DATA_DIR, "complaints_export.docx")
 BACKUP_ZIP_FILE = os.path.join(DATA_DIR, "bot_backup.zip")
+DB_NAME = os.path.join(DATA_DIR, "votes.db")  # backup ZIP uchun saqlanadi
 
+# =========================
+# DATABASE (SQLAlchemy + PostgreSQL)
+# =========================
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+# Railway ba'zan "postgres://" prefix beradi, SQLAlchemy "postgresql://" talab qiladi
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+if not DATABASE_URL:
+    raise ValueError(
+        "DATABASE_URL muhit o'zgaruvchisi topilmadi. "
+        "Railway PostgreSQL ulanganda bu o'zgaruvchi avtomatik qo'shiladi."
+    )
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,       # ulanish uzilganini avtomatik aniqlaydi
+    pool_recycle=300,         # 5 daqiqada bir ulanishni yangilaydi
+    pool_size=5,
+    max_overflow=10,
+    echo=False,
+)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+Base = declarative_base()
+
+# =========================
+# ORM MODELS
+# =========================
+class Vote(Base):
+    __tablename__ = "votes"
+    user_id = Column(Integer, primary_key=True)
+    full_name = Column(Text)
+    username = Column(Text)
+    subject_key = Column(Text, nullable=False)
+    teacher_key = Column(Text, nullable=False)
+    voted_at = Column(Text)
+
+
+class Setting(Base):
+    __tablename__ = "settings"
+    key = Column(Text, primary_key=True)
+    value = Column(Text)
+
+
+class UserPref(Base):
+    __tablename__ = "user_prefs"
+    user_id = Column(Integer, primary_key=True)
+    script = Column(Text, default="latin")
+    access_granted = Column(Integer, default=0)
+
+
+class TeacherRating(Base):
+    __tablename__ = "teacher_ratings"
+    __table_args__ = (
+        UniqueConstraint("user_id", "subject_key", "teacher_key", name="uq_user_subject_teacher"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False)
+    full_name = Column(Text)
+    username = Column(Text)
+    subject_key = Column(Text, nullable=False)
+    teacher_key = Column(Text, nullable=False)
+    rating = Column(Text, nullable=False)
+    rated_at = Column(Text)
+
+
+class Complaint(Base):
+    __tablename__ = "complaints"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=False)
+    full_name = Column(Text)
+    username = Column(Text)
+    message_text = Column(Text, nullable=False)
+    created_at = Column(Text)
+
+
+# =========================
+# DB SESSION HELPER
+# =========================
+@contextmanager
+def get_db():
+    """Context manager: session olib, commit/rollback/close qiladi."""
+    db: Session = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+# =========================
+# SUBJECTS
+# =========================
 SUBJECTS = {
     "s1": {
         "name": "Tillarni o'qitish metodikasi",
@@ -159,21 +267,14 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-engine = create_engine(DATABASE_URL)
-
-conn = engine.connect()
 db_lock = asyncio.Lock()
 WAITING_COMPLAINT_TEXT = set()
 COMPLAINT_COOLDOWN_SECONDS = 300
 COMPLAINT_MAX_LENGTH = 1000
 
-# Refresh tugmalarini ketma-ket bosishdan himoya
 LAST_REFRESH = {}
 REFRESH_BUSY = set()
 REFRESH_COOLDOWN_SECONDS = 1.5
-
 
 # =========================
 # O'ZBEKISTON VAQTI
@@ -187,12 +288,11 @@ def uz_now() -> datetime:
 # LOTIN / KRILL
 # =========================
 def latin_to_cyrillic_text(text: str) -> str:
-    # FIX #4: Takrorlangan juftlar olib tashlandi, to'g'ri tartib saqlandi
     pairs = [
-        ("O\u2018", "\u040e"), ("o\u2018", "\u045e"),   # O' → Ў (unicode apostrof)
-        ("G\u2018", "\u0492"), ("g\u2018", "\u0493"),   # G' → Ғ
-        ("O'", "\u040e"), ("o'", "\u045e"),              # O' → Ў (oddiy apostrof)
-        ("G'", "\u0492"), ("g'", "\u0493"),              # G' → Ғ
+        ("O\u2018", "\u040e"), ("o\u2018", "\u045e"),
+        ("G\u2018", "\u0492"), ("g\u2018", "\u0493"),
+        ("O'", "\u040e"), ("o'", "\u045e"),
+        ("G'", "\u0492"), ("g'", "\u0493"),
         ("Sh", "\u0428"), ("sh", "\u0448"),
         ("Ch", "\u0427"), ("ch", "\u0447"),
         ("Ya", "\u042f"), ("ya", "\u044f"),
@@ -246,17 +346,19 @@ def translit_html_safe(text: str, script: str) -> str:
 
 def get_user_script(user_id: int) -> str:
     ensure_user(user_id)
-    conn.execute(text("SELECT script FROM user_prefs WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    return row[0] if row and row[0] in ("latin", "cyrillic") else "latin"
+    with get_db() as db:
+        row = db.query(UserPref).filter(UserPref.user_id == user_id).first()
+    return row.script if row and row.script in ("latin", "cyrillic") else "latin"
 
 
 def set_user_script(user_id: int, script: str):
     ensure_user(user_id)
     if script not in ("latin", "cyrillic"):
         script = "latin"
-    conn.execute(text("UPDATE user_prefs SET script = ? WHERE user_id = ?", (script, user_id))
-    conn.commit()
+    with get_db() as db:
+        row = db.query(UserPref).filter(UserPref.user_id == user_id).first()
+        if row:
+            row.script = script
 
 
 def tr(user_id: int, text: str) -> str:
@@ -270,183 +372,161 @@ def dislike_label(user_id: int) -> str:
 
 
 # =========================
-# DB
+# DB HELPERS
 # =========================
 def normalize_subject_key(subject_key: str) -> str:
     if subject_key == "general":
         return "general"
     return OLD_TO_NEW_SUBJECT.get(subject_key, subject_key)
 
+
 def init_db():
-    conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS votes (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            username TEXT,
-            subject_key TEXT NOT NULL,
-            teacher_key TEXT NOT NULL,
-            voted_at TEXT
-        )
-    """)
-    conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS user_prefs (
-            user_id INTEGER PRIMARY KEY,
-            script TEXT DEFAULT 'latin',
-            access_granted INTEGER DEFAULT 0
-        )
-    """)
-    conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS teacher_ratings (
-            user_id INTEGER NOT NULL,
-            full_name TEXT,
-            username TEXT,
-            subject_key TEXT NOT NULL,
-            teacher_key TEXT NOT NULL,
-            rating TEXT NOT NULL CHECK(rating IN ('like', 'dislike')),
-            rated_at TEXT,
-            PRIMARY KEY (user_id, subject_key, teacher_key)
-        )
-    """)
-    conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS complaints (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            full_name TEXT,
-            username TEXT,
-            message_text TEXT NOT NULL,
-            created_at TEXT
-        )
-    """)
-    conn.commit()
+    """Barcha jadvallarni yaratadi va eski subject_keylarni migratsiya qiladi."""
+    Base.metadata.create_all(bind=engine)
     migrate_old_subject_keys()
     if get_setting("voting_open", "") == "":
         set_setting("voting_open", "1")
+    logging.info("Ma'lumotlar bazasi tayyor.")
+
 
 def migrate_old_subject_keys():
-    for old_key, new_key in OLD_TO_NEW_SUBJECT.items():
-        conn.execute(text("UPDATE votes SET subject_key = ? WHERE subject_key = ?", (new_key, old_key))
-        conn.execute(text("UPDATE teacher_ratings SET subject_key = ? WHERE subject_key = ?", (new_key, old_key))
-    conn.commit()
+    with get_db() as db:
+        for old_key, new_key in OLD_TO_NEW_SUBJECT.items():
+            db.query(Vote).filter(Vote.subject_key == old_key).update(
+                {Vote.subject_key: new_key}, synchronize_session=False
+            )
+            db.query(TeacherRating).filter(TeacherRating.subject_key == old_key).update(
+                {TeacherRating.subject_key: new_key}, synchronize_session=False
+            )
+
 
 def get_setting(key: str, default: str = "") -> str:
-    conn.execute(text("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cursor.fetchone()
-    return row[0] if row else default
+    with get_db() as db:
+        row = db.query(Setting).filter(Setting.key == key).first()
+    return row.value if row else default
+
 
 def set_setting(key: str, value: str):
-    conn.execute(text("""
-        INSERT INTO settings (key, value)
-        VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    """, (key, value))
-    conn.commit()
+    with get_db() as db:
+        row = db.query(Setting).filter(Setting.key == key).first()
+        if row:
+            row.value = value
+        else:
+            db.add(Setting(key=key, value=value))
+
 
 def ensure_user(user_id: int):
-    conn.execute(text("""
-        INSERT INTO user_prefs (user_id, script, access_granted)
-        VALUES (?, 'latin', 0)
-        ON CONFLICT(user_id) DO NOTHING
-    """, (user_id,))
-    conn.commit()
+    with get_db() as db:
+        exists = db.query(UserPref).filter(UserPref.user_id == user_id).first()
+        if not exists:
+            db.add(UserPref(user_id=user_id, script="latin", access_granted=0))
+
 
 def has_access(user_id: int) -> bool:
     ensure_user(user_id)
-    conn.execute(text("SELECT access_granted FROM user_prefs WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    return bool(row[0]) if row else False
+    with get_db() as db:
+        row = db.query(UserPref).filter(UserPref.user_id == user_id).first()
+    return bool(row.access_granted) if row else False
+
 
 def require_access_only(user_id: int) -> bool:
     return has_access(user_id)
 
+
 def grant_access(user_id: int):
     ensure_user(user_id)
-    conn.execute(text("UPDATE user_prefs SET access_granted = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
+    with get_db() as db:
+        row = db.query(UserPref).filter(UserPref.user_id == user_id).first()
+        if row:
+            row.access_granted = 1
+
 
 def reset_access(user_id: int):
     ensure_user(user_id)
-    conn.execute(text("UPDATE user_prefs SET access_granted = 0 WHERE user_id = ?", (user_id,))
-    conn.commit()
+    with get_db() as db:
+        row = db.query(UserPref).filter(UserPref.user_id == user_id).first()
+        if row:
+            row.access_granted = 0
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+
 def is_voting_open() -> bool:
     return get_setting("voting_open", "1") == "1"
+
 
 def open_voting():
     set_setting("voting_open", "1")
 
+
 def close_voting():
     set_setting("voting_open", "0")
 
+
 def has_voted(user_id: int) -> bool:
-    conn.execute(text("SELECT 1 FROM votes WHERE user_id = ?", (user_id,))
-    return cursor.fetchone() is not None
+    with get_db() as db:
+        return db.query(Vote).filter(Vote.user_id == user_id).first() is not None
 
-def save_vote(user_id: int, full_name: str, username: str, subject_key: str, teacher_key: str) -> bool:
-    """
-    Ovoz saqlaydi.
-    True  = ovoz muvaffaqiyatli saqlandi.
-    False = foydalanuvchi oldin ovoz bergan yoki PRIMARY KEY to'qnashuvi bo'lgan.
-    """
+
+def save_vote(
+    user_id: int, full_name: str, username: str, subject_key: str, teacher_key: str
+) -> bool:
     subject_key = normalize_subject_key(subject_key)
-
     try:
-        conn.execute(text("""
-            INSERT INTO votes (user_id, full_name, username, subject_key, teacher_key, voted_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            user_id,
-            full_name,
-            username,
-            subject_key,
-            teacher_key,
-            uz_now().strftime("%Y-%m-%d %H:%M:%S")
-        ))
-        conn.commit()
+        with get_db() as db:
+            db.add(Vote(
+                user_id=user_id,
+                full_name=full_name,
+                username=username,
+                subject_key=subject_key,
+                teacher_key=teacher_key,
+                voted_at=uz_now().strftime("%Y-%m-%d %H:%M:%S"),
+            ))
         return True
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return False
 
-# FIX #9: str | None o'rniga Optional[str] — Python 3.9 bilan moslik
+
 def get_total_votes(subject_key: Optional[str] = None) -> int:
-    if subject_key:
-        conn.execute(text("SELECT COUNT(*) FROM votes WHERE subject_key = ?", (normalize_subject_key(subject_key),))
-    else:
-        conn.execute(text("SELECT COUNT(*) FROM votes")
-    return cursor.fetchone()[0]
+    with get_db() as db:
+        q = db.query(Vote)
+        if subject_key:
+            q = q.filter(Vote.subject_key == normalize_subject_key(subject_key))
+        return q.count()
+
 
 def reset_votes():
-    conn.execute(text("DELETE FROM votes")
-    conn.commit()
+    with get_db() as db:
+        db.query(Vote).delete()
+
 
 def reset_ratings():
-    conn.execute(text("DELETE FROM teacher_ratings")
-    conn.commit()
+    with get_db() as db:
+        db.query(TeacherRating).delete()
+
 
 def reset_complaints():
-    conn.execute(text("DELETE FROM complaints")
-    conn.commit()
+    with get_db() as db:
+        db.query(Complaint).delete()
+
 
 def get_subject_name(subject_key: str) -> str:
     subject_key = normalize_subject_key(subject_key)
     return SUBJECTS.get(subject_key, {}).get("name", subject_key)
 
+
 def get_teacher_name(subject_key: str, teacher_key: str) -> str:
     subject_key = normalize_subject_key(subject_key)
     return SUBJECTS.get(subject_key, {}).get("teachers", {}).get(teacher_key, teacher_key)
+
 
 def build_progress_bar(percent: float, length: int = 14) -> str:
     filled = round((percent / 100) * length)
     filled = max(0, min(filled, length))
     return "\u2593" * filled + "\u2591" * (length - filled)
+
 
 def get_all_teachers_flat():
     items = []
@@ -455,53 +535,72 @@ def get_all_teachers_flat():
             items.append((subject_key, teacher_key, teacher_name))
     return items
 
+
 # =========================
 # RATING DB / STATS
 # =========================
-def save_teacher_rating(user_id: int, full_name: str, username: str, subject_key: str, teacher_key: str, rating: str):
+def save_teacher_rating(
+    user_id: int, full_name: str, username: str,
+    subject_key: str, teacher_key: str, rating: str
+):
     subject_key = normalize_subject_key(subject_key)
-    conn.execute(text("""
-        INSERT INTO teacher_ratings (user_id, full_name, username, subject_key, teacher_key, rating, rated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, subject_key, teacher_key)
-        DO UPDATE SET
-            full_name = excluded.full_name,
-            username = excluded.username,
-            rating = excluded.rating,
-            rated_at = excluded.rated_at
-    """, (user_id, full_name, username, subject_key, teacher_key, rating, uz_now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
+    now_str = uz_now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as db:
+        row = db.query(TeacherRating).filter(
+            TeacherRating.user_id == user_id,
+            TeacherRating.subject_key == subject_key,
+            TeacherRating.teacher_key == teacher_key,
+        ).first()
+        if row:
+            row.full_name = full_name
+            row.username = username
+            row.rating = rating
+            row.rated_at = now_str
+        else:
+            db.add(TeacherRating(
+                user_id=user_id,
+                full_name=full_name,
+                username=username,
+                subject_key=subject_key,
+                teacher_key=teacher_key,
+                rating=rating,
+                rated_at=now_str,
+            ))
 
-# FIX #9: Optional ishlatildi
-def get_user_teacher_rating(user_id: int, subject_key: str, teacher_key: str) -> Optional[str]:
-    conn.execute(text("""
-        SELECT rating FROM teacher_ratings
-        WHERE user_id = ? AND subject_key = ? AND teacher_key = ?
-    """, (user_id, normalize_subject_key(subject_key), teacher_key))
-    row = cursor.fetchone()
-    return row[0] if row else None
+
+def get_user_teacher_rating(
+    user_id: int, subject_key: str, teacher_key: str
+) -> Optional[str]:
+    with get_db() as db:
+        row = db.query(TeacherRating).filter(
+            TeacherRating.user_id == user_id,
+            TeacherRating.subject_key == normalize_subject_key(subject_key),
+            TeacherRating.teacher_key == teacher_key,
+        ).first()
+    return row.rating if row else None
+
 
 def get_rating_counts(subject_key: str, teacher_key: str):
-    conn.execute(text("""
-        SELECT
-            SUM(CASE WHEN rating = 'like' THEN 1 ELSE 0 END),
-            SUM(CASE WHEN rating = 'dislike' THEN 1 ELSE 0 END),
-            COUNT(*)
-        FROM teacher_ratings
-        WHERE subject_key = ? AND teacher_key = ?
-    """, (normalize_subject_key(subject_key), teacher_key))
-    like_count, dislike_count, total = cursor.fetchone()
-    like_count = like_count or 0
-    dislike_count = dislike_count or 0
-    total = total or 0
+    subject_key = normalize_subject_key(subject_key)
+    with get_db() as db:
+        rows = db.query(TeacherRating).filter(
+            TeacherRating.subject_key == subject_key,
+            TeacherRating.teacher_key == teacher_key,
+        ).all()
+    total = len(rows)
+    like_count = sum(1 for r in rows if r.rating == "like")
+    dislike_count = total - like_count
     like_percent = (like_count / total * 100) if total else 0
     dislike_percent = (dislike_count / total * 100) if total else 0
     return like_count, dislike_count, total, like_percent, dislike_percent
 
+
 def rating_rows():
     rows = []
     for subject_key, teacher_key, teacher_name in get_all_teachers_flat():
-        like_count, dislike_count, total, like_percent, dislike_percent = get_rating_counts(subject_key, teacher_key)
+        like_count, dislike_count, total, like_percent, dislike_percent = get_rating_counts(
+            subject_key, teacher_key
+        )
         rows.append({
             "subject_key": subject_key,
             "subject_name": get_subject_name(subject_key),
@@ -515,39 +614,36 @@ def rating_rows():
         })
     return rows
 
+
 def get_vote_percent(count: int, denominator: int) -> float:
     return (count / denominator * 100) if denominator > 0 else 0.0
 
+
 def save_complaint(user_id: int, full_name: str, username: str, message_text: str):
-    conn.execute(text("""
-        INSERT INTO complaints (user_id, full_name, username, message_text, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        user_id,
-        full_name,
-        username,
-        message_text,
-        uz_now().strftime("%Y-%m-%d %H:%M:%S")
-    ))
-    conn.commit()
+    with get_db() as db:
+        db.add(Complaint(
+            user_id=user_id,
+            full_name=full_name,
+            username=username,
+            message_text=message_text,
+            created_at=uz_now().strftime("%Y-%m-%d %H:%M:%S"),
+        ))
 
 
 def get_last_complaint_for_user(user_id: int):
-    conn.execute(text("""
-        SELECT message_text, created_at
-        FROM complaints
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 1
-    """, (user_id,))
-    return cursor.fetchone()
+    with get_db() as db:
+        row = (
+            db.query(Complaint)
+            .filter(Complaint.user_id == user_id)
+            .order_by(Complaint.id.desc())
+            .first()
+        )
+    if row:
+        return row.message_text, row.created_at
+    return None
 
 
 def complaint_allowed(user_id: int, message_text: str):
-    """
-    Shikoyat/taklif spam himoyasi.
-    True, '' qaytarilsa yuborish mumkin. Aks holda False va xabar matni qaytadi.
-    """
     text = (message_text or "").strip()
     if len(text) > COMPLAINT_MAX_LENGTH:
         return False, f"Xabar juda uzun. Iltimos, {COMPLAINT_MAX_LENGTH} ta belgidan oshirmang."
@@ -572,24 +668,22 @@ def complaint_allowed(user_id: int, message_text: str):
 
     return True, ""
 
-# FIX #9: Optional ishlatildi
+
 def get_complaints_rows(limit: Optional[int] = None):
-    sql = """
-        SELECT id, user_id, full_name, username, message_text, created_at
-        FROM complaints
-        ORDER BY id DESC
-    """
-    params = ()
-    if limit:
-        sql += " LIMIT ?"
-        params = (limit,)
-    conn.execute(text(sql, params)
-    return cursor.fetchall()
+    with get_db() as db:
+        q = db.query(Complaint).order_by(Complaint.id.desc())
+        if limit:
+            q = q.limit(limit)
+        rows = q.all()
+    return [
+        (r.id, r.user_id, r.full_name, r.username, r.message_text, r.created_at)
+        for r in rows
+    ]
 
 
 def get_complaints_count() -> int:
-    conn.execute(text("SELECT COUNT(*) FROM complaints")
-    return cursor.fetchone()[0]
+    with get_db() as db:
+        return db.query(Complaint).count()
 
 
 def get_complaints_text(user_id: int) -> str:
@@ -626,7 +720,6 @@ def export_complaints_to_docx() -> str:
             f.write("Shikoyat va takliflar\n")
             f.write(f"Jami: {len(rows)} ta\n\n")
             for i, (cid, uid, full_name, username, message_text, created_at) in enumerate(rows, start=1):
-                # FIX #3: f-string ichida apostrof — o'zgaruvchiga olindi
                 name = full_name or "Noma'lum"
                 uname = f"@{username}" if username else ""
                 f.write(f"{i}. {name} ({uname})\n")
@@ -660,7 +753,6 @@ def export_complaints_to_docx() -> str:
         for i, (cid, uid, full_name, username, message_text, created_at) in enumerate(rows, start=1):
             cells = table.add_row().cells
             cells[0].text = str(i)
-            # FIX #3: apostrof xatosi bartaraf etildi
             cells[1].text = full_name or "Noma'lum"
             cells[2].text = f"@{username}" if username else ""
             cells[3].text = str(uid)
@@ -675,8 +767,10 @@ def export_complaints_to_docx() -> str:
     doc.save(COMPLAINTS_DOCX_FILE)
     return COMPLAINTS_DOCX_FILE
 
+
 def get_subscription_required_alert(user_id: int) -> str:
     return tr(user_id, "Avval Telegram kanalga obuna bo'ling va ✅ Tekshirish tugmasini bosing.")
+
 
 # =========================
 # TEXTS
@@ -757,7 +851,6 @@ def get_complaint_intro_text(user_id: int) -> str:
         "Bekor qilish uchun <b>❌ Bekor qilish</b> tugmasini bosing."
     )
 
-
 def get_complaint_saved_text(user_id: int) -> str:
     return tr(user_id, "✅ <b>Xabaringiz qabul qilindi.</b>\n\nRahmat, murojaatingiz adminlarga yuborildi.")
 
@@ -770,14 +863,13 @@ def get_admin_panel_text(user_id: int) -> str:
     return tr(user_id, f"🎛 <b>Admin panel</b>\n\nVoting holati: {status_text}\nJami ovozlar: {get_total_votes()}")
 
 def get_general_results_text(user_id: int) -> str:
-    conn.execute(text("""
-        SELECT subject_key, teacher_key, COUNT(*)
-        FROM votes
-        GROUP BY subject_key, teacher_key
-    """)
+    with get_db() as db:
+        all_votes = db.query(Vote).all()
+
     counts = {}
-    for subject_key, teacher_key, count in cursor.fetchall():
-        counts[(normalize_subject_key(subject_key), teacher_key)] = count
+    for v in all_votes:
+        key = (normalize_subject_key(v.subject_key), v.teacher_key)
+        counts[key] = counts.get(key, 0) + 1
 
     total_votes = sum(counts.values())
     lines = ["📊 <b>Umumiy natijalar</b>\n"]
@@ -804,18 +896,19 @@ def get_subject_results_text(user_id: int, subject_key: str) -> str:
     if subject_key not in SUBJECTS:
         return tr(user_id, "Noto'g'ri kafedra.")
 
-    conn.execute(text("""
-        SELECT teacher_key, COUNT(*)
-        FROM votes
-        WHERE subject_key = ?
-        GROUP BY teacher_key
-    """, (subject_key,))
-    subject_counts = {teacher_key: count for teacher_key, count in cursor.fetchall()}
+    with get_db() as db:
+        subject_votes = (
+            db.query(Vote)
+            .filter(Vote.subject_key == subject_key)
+            .all()
+        )
+        total_votes = db.query(Vote).count()
 
-    conn.execute(text("SELECT COUNT(*) FROM votes")
-    total_votes = cursor.fetchone()[0]
+    subject_counts = {}
+    for v in subject_votes:
+        subject_counts[v.teacher_key] = subject_counts.get(v.teacher_key, 0) + 1
+
     subject_total = sum(subject_counts.values())
-
     lines = [f"📊 <b>{get_subject_name(subject_key)} bo'yicha natijalar</b>\n"]
 
     for teacher_key, teacher_name in SUBJECTS[subject_key]["teachers"].items():
@@ -836,7 +929,6 @@ def get_subject_results_text(user_id: int, subject_key: str) -> str:
     return tr(user_id, text)
 
 
-# FIX #9: Optional ishlatildi
 def get_rating_stats_text(user_id: int, subject_key: Optional[str] = None) -> str:
     rows = rating_rows()
     if subject_key and subject_key != "general":
@@ -855,6 +947,7 @@ def get_rating_stats_text(user_id: int, subject_key: Optional[str] = None) -> st
         )
     text = "\n".join(lines)
     return tr(user_id, text[:4000] + ("\n\n... qisqartirildi" if len(text) > 4000 else ""))
+
 
 def get_top_ratings_text(user_id: int) -> str:
     rows = [r for r in rating_rows() if r["total"] > 0]
@@ -879,70 +972,69 @@ def get_top_ratings_text(user_id: int) -> str:
 
 
 def get_users_text(user_id: int) -> str:
-    conn.execute(text("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
-    rows = cursor.fetchall()
+    with get_db() as db:
+        rows = db.query(Vote).order_by(Vote.voted_at.desc()).all()
+
     if not rows:
         return tr(user_id, "👥 Hali hech kim ovoz bermagan.")
+
     lines = [f"👥 <b>Kim kimga ovoz berdi</b>\n\nJami: {len(rows)} ta foydalanuvchi\n"]
-    for i, (uid, full_name, username, subject_key, teacher_key, voted_at) in enumerate(rows, start=1):
-        subject_key = normalize_subject_key(subject_key)
-        # FIX #3: f-string ichida apostrof xatosi — o'zgaruvchiga olindi
-        name = full_name or "Noma'lum"
+    for i, v in enumerate(rows, start=1):
+        subject_key = normalize_subject_key(v.subject_key)
+        name = v.full_name or "Noma'lum"
         line = f"{i}. <b>{name}</b>"
-        if username:
-            line += f" (@{username})"
+        if v.username:
+            line += f" (@{v.username})"
         line += f"\n   → Kafedra: {get_subject_name(subject_key)}"
-        line += f"\n   → O'qituvchi: {get_teacher_name(subject_key, teacher_key)}"
-        line += f"\n   → ID: <code>{uid}</code>"
-        if voted_at:
-            line += f"\n   → {voted_at}"
+        line += f"\n   → O'qituvchi: {get_teacher_name(subject_key, v.teacher_key)}"
+        line += f"\n   → ID: <code>{v.user_id}</code>"
+        if v.voted_at:
+            line += f"\n   → {v.voted_at}"
         lines.append(line)
+
     text = "\n\n".join(lines)
     return tr(user_id, text[:4000] + ("\n\n... qisqartirildi" if len(text) > 4000 else ""))
 
 
 def get_my_vote_text(user_id: int) -> str:
-    conn.execute(text("""
-        SELECT subject_key, teacher_key, voted_at
-        FROM votes
-        WHERE user_id = ?
-    """, (user_id,))
-    row = cursor.fetchone()
+    with get_db() as db:
+        row = db.query(Vote).filter(Vote.user_id == user_id).first()
+
     if not row:
         return tr(user_id, "🧾 <b>Mening ovozim</b>\n\nSiz hali asosiy ovoz bermagansiz.")
 
-    subject_key, teacher_key, voted_at = row
-    subject_key = normalize_subject_key(subject_key)
+    subject_key = normalize_subject_key(row.subject_key)
     return tr(
         user_id,
         f"🧾 <b>Mening ovozim</b>\n\n"
         f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n"
-        f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, teacher_key)}\n"
-        f"<b>Sana:</b> {voted_at or 'Noma\'lum'}"
+        f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, row.teacher_key)}\n"
+        f"<b>Sana:</b> {row.voted_at or 'Noma\\'lum'}"
     )
 
 
 def get_my_ratings_text(user_id: int) -> str:
-    conn.execute(text("""
-        SELECT subject_key, teacher_key, rating, rated_at
-        FROM teacher_ratings
-        WHERE user_id = ?
-        ORDER BY rated_at DESC
-    """, (user_id,))
-    rows = cursor.fetchall()
+    with get_db() as db:
+        rows = (
+            db.query(TeacherRating)
+            .filter(TeacherRating.user_id == user_id)
+            .order_by(TeacherRating.rated_at.desc())
+            .all()
+        )
+
     if not rows:
         return tr(user_id, "⭐️ <b>Mening baholarim</b>\n\nSiz hali o'qituvchilarga like/dislike bermagansiz.")
 
     lines = [f"⭐️ <b>Mening baholarim</b>\n\nJami: {len(rows)} ta baho\n"]
-    for i, (subject_key, teacher_key, rating, rated_at) in enumerate(rows, start=1):
-        subject_key = normalize_subject_key(subject_key)
-        icon = "👍" if rating == "like" else "👎"
-        label = like_label(user_id) if rating == "like" else dislike_label(user_id)
+    for i, r in enumerate(rows, start=1):
+        subject_key = normalize_subject_key(r.subject_key)
+        icon = "👍" if r.rating == "like" else "👎"
+        label = like_label(user_id) if r.rating == "like" else dislike_label(user_id)
         lines.append(
-            f"{i}. <b>{get_teacher_name(subject_key, teacher_key)}</b>\n"
+            f"{i}. <b>{get_teacher_name(subject_key, r.teacher_key)}</b>\n"
             f"   Kafedra: {get_subject_name(subject_key)}\n"
             f"   Baho: {icon} {label}\n"
-            f"   Sana: {rated_at or ''}"
+            f"   Sana: {r.rated_at or ''}"
         )
 
     text = "\n\n".join(lines)
@@ -954,8 +1046,12 @@ def get_teacher_detailed_stats_text(user_id: int, subject_key: str, teacher_key:
     if subject_key not in SUBJECTS or teacher_key not in SUBJECTS[subject_key]["teachers"]:
         return tr(user_id, "Noto'g'ri o'qituvchi tanlandi.")
 
-    conn.execute(text("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-    vote_count = cursor.fetchone()[0]
+    with get_db() as db:
+        vote_count = db.query(Vote).filter(
+            Vote.subject_key == subject_key,
+            Vote.teacher_key == teacher_key,
+        ).count()
+
     subject_total = get_total_votes(subject_key)
     total_votes = get_total_votes()
     vote_percent_subject = get_vote_percent(vote_count, subject_total)
@@ -977,14 +1073,11 @@ def get_teacher_detailed_stats_text(user_id: int, subject_key: str, teacher_key:
 
 
 def create_backup_zip() -> str:
-    conn.commit()
     votes_path = export_votes_to_excel()
     rating_path = export_rating_to_excel()
     complaints_path = export_complaints_to_docx()
 
     with zipfile.ZipFile(BACKUP_ZIP_FILE, "w", zipfile.ZIP_DEFLATED) as zf:
-        if os.path.exists(DB_NAME):
-            zf.write(DB_NAME, arcname="votes.db")
         for path in (votes_path, rating_path, complaints_path):
             if path and os.path.exists(path):
                 zf.write(path, arcname=os.path.basename(path))
@@ -999,64 +1092,89 @@ def get_results_text_by_scope(user_id: int, scope: str) -> str:
         return get_subject_results_text(user_id, scope)
     return tr(user_id, "Noto'g'ri bo'lim.")
 
+
 # =========================
 # EXPORT
 # =========================
 def export_votes_to_csv() -> str:
-    conn.execute(text("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
-    rows = cursor.fetchall()
+    with get_db() as db:
+        rows = db.query(Vote).order_by(Vote.voted_at.desc()).all()
+
     with open(EXPORT_FILE, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["User ID", "Full Name", "Username", "Subject", "Teacher", "Voted At"])
-        for user_id, full_name, username, subject_key, teacher_key, voted_at in rows:
-            subject_key = normalize_subject_key(subject_key)
-            writer.writerow([user_id, full_name or "", username or "", get_subject_name(subject_key), get_teacher_name(subject_key, teacher_key), voted_at or ""])
+        for v in rows:
+            sk = normalize_subject_key(v.subject_key)
+            writer.writerow([
+                v.user_id, v.full_name or "", v.username or "",
+                get_subject_name(sk), get_teacher_name(sk, v.teacher_key), v.voted_at or ""
+            ])
     return EXPORT_FILE
+
 
 def ws_append_header(ws, headers):
     ws.append(headers)
     for cell in ws[1]:
         cell.style = "Headline 4"
 
+
 def export_votes_to_excel() -> str:
     if Workbook is None:
         return export_votes_to_csv()
+
+    with get_db() as db:
+        all_votes = db.query(Vote).order_by(Vote.voted_at.desc()).all()
+
     wb = Workbook()
     wb.remove(wb.active)
 
     ws = wb.create_sheet("Umumiy ovozlar")
     ws_append_header(ws, ["User ID", "Full Name", "Username", "Kafedra", "O'qituvchi", "Voted At"])
-    conn.execute(text("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
-    for user_id, full_name, username, subject_key, teacher_key, voted_at in cursor.fetchall():
-        subject_key = normalize_subject_key(subject_key)
-        ws.append([user_id, full_name or "", username or "", get_subject_name(subject_key), get_teacher_name(subject_key, teacher_key), voted_at or ""])
+    for v in all_votes:
+        sk = normalize_subject_key(v.subject_key)
+        ws.append([
+            v.user_id, v.full_name or "", v.username or "",
+            get_subject_name(sk), get_teacher_name(sk, v.teacher_key), v.voted_at or ""
+        ])
 
     for subject_key, subject_data in SUBJECTS.items():
         ws = wb.create_sheet(subject_data["name"][:31])
         ws_append_header(ws, ["User ID", "Full Name", "Username", "O'qituvchi", "Voted At"])
-        conn.execute(text("SELECT user_id, full_name, username, teacher_key, voted_at FROM votes WHERE subject_key = ? ORDER BY voted_at DESC", (subject_key,))
-        for user_id, full_name, username, teacher_key, voted_at in cursor.fetchall():
-            ws.append([user_id, full_name or "", username or "", get_teacher_name(subject_key, teacher_key), voted_at or ""])
+        subject_votes = [v for v in all_votes if normalize_subject_key(v.subject_key) == subject_key]
+        for v in subject_votes:
+            ws.append([
+                v.user_id, v.full_name or "", v.username or "",
+                get_teacher_name(subject_key, v.teacher_key), v.voted_at or ""
+            ])
 
     ws = wb.create_sheet("Umumiy natija")
     ws_append_header(ws, ["Kafedra", "O'qituvchi", "Ovozlar", "Foiz"])
-    total = get_total_votes()
+    total = len(all_votes)
     for subject_key, teacher_key, teacher_name in get_all_teachers_flat():
-        conn.execute(text("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-        count = cursor.fetchone()[0]
-        ws.append([get_subject_name(subject_key), teacher_name, count, round((count / total * 100) if total else 0, 2)])
+        count = sum(
+            1 for v in all_votes
+            if normalize_subject_key(v.subject_key) == subject_key and v.teacher_key == teacher_key
+        )
+        ws.append([
+            get_subject_name(subject_key), teacher_name,
+            count, round((count / total * 100) if total else 0, 2)
+        ])
 
     for subject_key, subject_data in SUBJECTS.items():
         ws = wb.create_sheet((subject_data["name"][:24] + " natija")[:31])
         ws_append_header(ws, ["O'qituvchi", "Ovozlar", "Kafedra ichidagi foiz"])
-        subject_total = get_total_votes(subject_key)
+        subject_votes = [v for v in all_votes if normalize_subject_key(v.subject_key) == subject_key]
+        subject_total = len(subject_votes)
         for teacher_key, teacher_name in subject_data["teachers"].items():
-            conn.execute(text("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-            count = cursor.fetchone()[0]
-            ws.append([teacher_name, count, round((count / subject_total * 100) if subject_total else 0, 2)])
+            count = sum(1 for v in subject_votes if v.teacher_key == teacher_key)
+            ws.append([
+                teacher_name, count,
+                round((count / subject_total * 100) if subject_total else 0, 2)
+            ])
 
     wb.save(VOTES_XLSX_FILE)
     return VOTES_XLSX_FILE
+
 
 def export_rating_to_excel() -> str:
     if Workbook is None:
@@ -1065,7 +1183,11 @@ def export_rating_to_excel() -> str:
             writer = csv.writer(f)
             writer.writerow(["Kafedra", "O'qituvchi", "Like", "Dislike", "Jami", "Like %", "Dislike %"])
             for r in rating_rows():
-                writer.writerow([r["subject_name"], r["teacher_name"], r["like"], r["dislike"], r["total"], round(r["like_percent"], 2), round(r["dislike_percent"], 2)])
+                writer.writerow([
+                    r["subject_name"], r["teacher_name"],
+                    r["like"], r["dislike"], r["total"],
+                    round(r["like_percent"], 2), round(r["dislike_percent"], 2)
+                ])
         return path
 
     wb = Workbook()
@@ -1074,75 +1196,37 @@ def export_rating_to_excel() -> str:
     ws = wb.create_sheet("Umumiy rating")
     ws_append_header(ws, ["Kafedra", "O'qituvchi", "Like", "Dislike", "Jami", "Like %", "Dislike %"])
     for r in rating_rows():
-        ws.append([r["subject_name"], r["teacher_name"], r["like"], r["dislike"], r["total"], round(r["like_percent"], 2), round(r["dislike_percent"], 2)])
+        ws.append([
+            r["subject_name"], r["teacher_name"],
+            r["like"], r["dislike"], r["total"],
+            round(r["like_percent"], 2), round(r["dislike_percent"], 2)
+        ])
 
     for subject_key, subject_data in SUBJECTS.items():
         ws = wb.create_sheet((subject_data["name"][:24] + " rating")[:31])
         ws_append_header(ws, ["O'qituvchi", "Like", "Dislike", "Jami", "Like %", "Dislike %"])
         for r in [x for x in rating_rows() if x["subject_key"] == subject_key]:
-            ws.append([r["teacher_name"], r["like"], r["dislike"], r["total"], round(r["like_percent"], 2), round(r["dislike_percent"], 2)])
+            ws.append([
+                r["teacher_name"], r["like"], r["dislike"], r["total"],
+                round(r["like_percent"], 2), round(r["dislike_percent"], 2)
+            ])
+
+    with get_db() as db:
+        all_ratings = db.query(TeacherRating).order_by(TeacherRating.rated_at.desc()).all()
 
     ws = wb.create_sheet("Umumiy ovozlar")
     ws_append_header(ws, ["User ID", "Full Name", "Username", "Kafedra", "O'qituvchi", "Rating", "Rated At"])
-    conn.execute(text("SELECT user_id, full_name, username, subject_key, teacher_key, rating, rated_at FROM teacher_ratings ORDER BY rated_at DESC")
-    for user_id, full_name, username, subject_key, teacher_key, rating, rated_at in cursor.fetchall():
-        subject_key = normalize_subject_key(subject_key)
-        ws.append([user_id, full_name or "", username or "", get_subject_name(subject_key), get_teacher_name(subject_key, teacher_key), rating, rated_at or ""])
+    for r in all_ratings:
+        sk = normalize_subject_key(r.subject_key)
+        ws.append([
+            r.user_id, r.full_name or "", r.username or "",
+            get_subject_name(sk), get_teacher_name(sk, r.teacher_key),
+            r.rating, r.rated_at or ""
+        ])
 
     wb.save(RATING_XLSX_FILE)
     return RATING_XLSX_FILE
 
-
-def export_complaints_to_word() -> str:
-    conn.execute(text("""
-        SELECT user_id, full_name, username, message_text, created_at
-        FROM complaints
-        ORDER BY created_at DESC
-    """)
-    rows = cursor.fetchall()
-
-    if Document is None:
-        txt_path = os.path.join(DATA_DIR, "shikoyat_takliflar.txt")
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write("Shikoyat va takliflar\n")
-            f.write("=" * 30 + "\n\n")
-            if not rows:
-                f.write("Hali shikoyat yoki taklif yo'q.\n")
-            for i, (user_id, full_name, username, message_text, created_at) in enumerate(rows, 1):
-                # FIX #3: f-string ichida apostrof xatosi tuzatildi
-                name = full_name or "Noma'lum"
-                uname = f"@{username}" if username else "yo'q"
-                f.write(f"{i}. Foydalanuvchi: {name}\n")
-                f.write(f"   Username: {uname}\n")
-                f.write(f"   ID: {user_id}\n")
-                f.write(f"   Sana: {created_at or ''}\n")
-                f.write(f"   Matn: {message_text or ''}\n")
-                f.write("-" * 30 + "\n")
-        return txt_path
-
-    doc = Document()
-    doc.add_heading("Shikoyat va takliflar", level=1)
-
-    if not rows:
-        doc.add_paragraph("Hali shikoyat yoki taklif yo'q.")
-    else:
-        table = doc.add_table(rows=1, cols=6)
-        table.style = "Table Grid"
-        headers = ["№", "F.I.Sh", "Username", "User ID", "Sana", "Matn"]
-        for idx, header in enumerate(headers):
-            table.rows[0].cells[idx].text = header
-
-        for i, (user_id, full_name, username, message_text, created_at) in enumerate(rows, 1):
-            cells = table.add_row().cells
-            cells[0].text = str(i)
-            cells[1].text = full_name or "Noma'lum"
-            cells[2].text = f"@{username}" if username else ""
-            cells[3].text = str(user_id)
-            cells[4].text = created_at or ""
-            cells[5].text = message_text or ""
-
-    doc.save(COMPLAINTS_DOCX_FILE)
-    return COMPLAINTS_DOCX_FILE
 
 # =========================
 # SUBSCRIPTION
@@ -1159,7 +1243,12 @@ async def check_user_subscription(user_id: int) -> bool:
         logging.error(f"Obunani tekshirishda xatolik: {e}")
         return False
 
-async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
+
+async def safe_edit_message(
+    callback: CallbackQuery,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+):
     try:
         await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=reply_markup)
     except TelegramBadRequest as e:
@@ -1174,27 +1263,18 @@ async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup: Op
         logging.error(f"safe_edit_message umumiy xato: {e}")
 
 
-
 def add_refresh_time(text: str, user_id: int) -> str:
-    """Telegram edit_text 'message is not modified' xatosini oldini olish uchun vaqt qo'shadi."""
     return text + tr(user_id, f"  ⏱ Yangilandi: {uz_now().strftime('%H:%M:%S.%f')[:-3]}")
 
 
 def can_start_refresh(user_id: int, key: str) -> bool:
-    """
-    Bitta user bitta bo'limda refreshni ketma-ket bosib yuborsa,
-    parallel callbacklar natijani chalkashtirib yubormasligi uchun cheklaydi.
-    """
     now = uz_now().timestamp()
     refresh_key = (user_id, key)
-
     if refresh_key in REFRESH_BUSY:
         return False
-
     last = LAST_REFRESH.get(refresh_key, 0)
     if now - last < REFRESH_COOLDOWN_SECONDS:
         return False
-
     REFRESH_BUSY.add(refresh_key)
     LAST_REFRESH[refresh_key] = now
     return True
@@ -1213,6 +1293,7 @@ def get_settings_text(user_id: int) -> str:
         f"Hozirgi yozuv: <b>{current}</b>\n\n"
         f"Kerakli yozuv turini tanlang:"
     )
+
 
 # =========================
 # KEYBOARDS
@@ -1240,7 +1321,6 @@ def home_keyboard(user_id: int) -> InlineKeyboardMarkup:
         kb.row(InlineKeyboardButton(text=tr(user_id, "📩 Shikoyat va takliflar"), callback_data="go_complaint_panel"))
     else:
         kb.row(InlineKeyboardButton(text=tr(user_id, "✅ Obunani tekshirish"), callback_data="check_subscription"))
-
     kb.row(
         InlineKeyboardButton(text=tr(user_id, "ℹ️ Yordam"), callback_data="help_info"),
         InlineKeyboardButton(text=tr(user_id, "⚙️ Sozlamalar"), callback_data="user_settings")
@@ -1270,7 +1350,12 @@ def teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     teachers = list(SUBJECTS[subject_key]["teachers"].items())
     for i in range(0, len(teachers), 2):
-        row = [InlineKeyboardButton(text=tr(user_id, teacher_name), callback_data=f"vote:{subject_key}:{teacher_key}") for teacher_key, teacher_name in teachers[i:i + 2]]
+        row = [
+            InlineKeyboardButton(
+                text=tr(user_id, teacher_name),
+                callback_data=f"vote:{subject_key}:{teacher_key}"
+            ) for teacher_key, teacher_name in teachers[i:i + 2]
+        ]
         kb.row(*row)
     kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Kafedralarga qaytish"), callback_data="go_vote_panel"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
@@ -1287,7 +1372,12 @@ def rating_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMa
     kb = InlineKeyboardBuilder()
     teachers = list(SUBJECTS[subject_key]["teachers"].items())
     for i in range(0, len(teachers), 2):
-        row = [InlineKeyboardButton(text=tr(user_id, teacher_name), callback_data=f"rating_teacher:{subject_key}:{teacher_key}") for teacher_key, teacher_name in teachers[i:i + 2]]
+        row = [
+            InlineKeyboardButton(
+                text=tr(user_id, teacher_name),
+                callback_data=f"rating_teacher:{subject_key}:{teacher_key}"
+            ) for teacher_key, teacher_name in teachers[i:i + 2]
+        ]
         kb.row(*row)
     kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Kafedralarga qaytish"), callback_data="go_rating_panel"))
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
@@ -1359,7 +1449,6 @@ def after_vote_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
     return kb.as_markup()
 
-
 def confirm_vote_keyboard(user_id: int, subject_key: str, teacher_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
@@ -1370,12 +1459,10 @@ def confirm_vote_keyboard(user_id: int, subject_key: str, teacher_key: str) -> I
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
 
-
 def simple_back_home_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
     return kb.as_markup()
-
 
 def teacher_stats_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1384,17 +1471,20 @@ def teacher_stats_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
-
 def teacher_stats_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     teachers = list(SUBJECTS[subject_key]["teachers"].items())
     for i in range(0, len(teachers), 2):
-        row = [InlineKeyboardButton(text=tr(user_id, teacher_name), callback_data=f"teacher_stats:{subject_key}:{teacher_key}") for teacher_key, teacher_name in teachers[i:i + 2]]
+        row = [
+            InlineKeyboardButton(
+                text=tr(user_id, teacher_name),
+                callback_data=f"teacher_stats:{subject_key}:{teacher_key}"
+            ) for teacher_key, teacher_name in teachers[i:i + 2]
+        ]
         kb.row(*row)
     kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Kafedralarga qaytish"), callback_data="admin_teacher_stats"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
-
 
 def teacher_stats_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
@@ -1466,6 +1556,7 @@ def users_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
     )
     return kb.as_markup()
 
+
 # =========================
 # START / COMMANDS
 # =========================
@@ -1473,15 +1564,12 @@ def users_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
 async def start_handler(message: Message):
     user_id = message.from_user.id
     ensure_user(user_id)
-
     if has_access(user_id):
         await message.answer(get_home_text(user_id), parse_mode="HTML", reply_markup=home_keyboard(user_id))
         return
-
     if not await check_user_subscription(user_id):
         await message.answer(get_welcome_text(user_id), parse_mode="HTML", reply_markup=subscription_keyboard(user_id))
         return
-
     grant_access(user_id)
     await message.answer(get_home_text(user_id), parse_mode="HTML", reply_markup=home_keyboard(user_id))
 
@@ -1492,11 +1580,11 @@ async def my_access_handler(message: Message):
     ensure_user(user_id)
     if not is_admin(user_id):
         return
-    conn.execute(text("SELECT access_granted FROM user_prefs WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    # FIX #3: apostrof xatosi tuzatildi
-    val = row[0] if row else "yo'q"
+    with get_db() as db:
+        row = db.query(UserPref).filter(UserPref.user_id == user_id).first()
+    val = row.access_granted if row else "yo'q"
     await message.answer(f"access_granted: {val}")
+
 
 @dp.message(Command("check_channel"))
 async def check_channel_handler(message: Message):
@@ -1510,37 +1598,36 @@ async def check_channel_handler(message: Message):
         if member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}:
             await message.answer(f"✅ Bot kanalni ko'ra olyapti va admin.\nKanal: {CHANNEL_USERNAME}")
         else:
-            await message.answer("⚠️ Bot kanalni ko'ryapti, lekin admin emas. Obuna tekshiruvi to'liq ishlashi uchun botni kanalga admin qiling.")
+            await message.answer("⚠️ Bot kanalni ko'ryapti, lekin admin emas.")
     except Exception as e:
-        await message.answer(f"❌ Kanalni tekshirib bo'lmadi.\nBotni kanalga admin qiling.\nXato: {e}")
+        await message.answer(f"❌ Kanalni tekshirib bo'lmadi.\nXato: {e}")
+
 
 @dp.message(Command("results"))
 async def results_handler(message: Message):
     user_id = message.from_user.id
     ensure_user(user_id)
-    await message.answer(get_results_menu_text(user_id, False), parse_mode="HTML", reply_markup=results_menu_keyboard_user(user_id))
+    await message.answer(
+        get_results_menu_text(user_id, False), parse_mode="HTML",
+        reply_markup=results_menu_keyboard_user(user_id)
+    )
+
 
 @dp.message(Command("debug_eshnazarova"))
 async def debug_eshnazarova_handler(message: Message):
     user_id = message.from_user.id
     if not is_admin(user_id):
         return
-
-    conn.execute(text("""
-        SELECT user_id, full_name, username, subject_key, teacher_key, voted_at
-        FROM votes
-        WHERE teacher_key = 'aif_10'
-        ORDER BY voted_at DESC
-    """)
-    rows = cursor.fetchall()
+    with get_db() as db:
+        rows = db.query(Vote).filter(Vote.teacher_key == "aif_10").order_by(Vote.voted_at.desc()).all()
     if not rows:
         await message.answer("Eshnazarova Maziya Allanazarovna uchun bazada ovoz yo'q.")
         return
-
     lines = ["Eshnazarova Maziya Allanazarovna uchun bazadagi ovozlar:"]
-    for uid, full_name, username, subject_key, teacher_key, voted_at in rows:
-        lines.append(f"ID: {uid} | {full_name or ''} | @{username or ''} | {subject_key}/{teacher_key} | {voted_at}")
+    for v in rows:
+        lines.append(f"ID: {v.user_id} | {v.full_name or ''} | @{v.username or ''} | {v.subject_key}/{v.teacher_key} | {v.voted_at}")
     await message.answer("\n".join(lines[:50]))
+
 
 @dp.message(Command("admin"))
 async def admin_panel_handler(message: Message):
@@ -1551,6 +1638,7 @@ async def admin_panel_handler(message: Message):
         return
     await message.answer(get_admin_panel_text(user_id), parse_mode="HTML", reply_markup=admin_panel_keyboard(user_id))
 
+
 @dp.message(Command("users"))
 async def admin_users_handler(message: Message):
     user_id = message.from_user.id
@@ -1558,6 +1646,7 @@ async def admin_users_handler(message: Message):
         await message.answer("Siz admin emassiz.")
         return
     await message.answer(get_users_text(user_id), parse_mode="HTML", reply_markup=users_keyboard_admin(user_id))
+
 
 @dp.message(Command("export"))
 async def admin_export_handler(message: Message):
@@ -1568,6 +1657,7 @@ async def admin_export_handler(message: Message):
     filename = export_votes_to_excel()
     await message.answer_document(FSInputFile(filename), caption="📁 Ovozlar Excel fayl ko'rinishida.")
 
+
 @dp.message(Command("open"))
 async def admin_open_handler(message: Message):
     user_id = message.from_user.id
@@ -1577,6 +1667,7 @@ async def admin_open_handler(message: Message):
     open_voting()
     await message.answer("🟢 Ovoz berish ochildi.")
 
+
 @dp.message(Command("close"))
 async def admin_close_handler(message: Message):
     user_id = message.from_user.id
@@ -1585,6 +1676,7 @@ async def admin_close_handler(message: Message):
         return
     close_voting()
     await message.answer("🔴 Ovoz berish yopildi.")
+
 
 @dp.message(Command("reset_votes"))
 async def admin_reset_handler(message: Message):
@@ -1597,6 +1689,7 @@ async def admin_reset_handler(message: Message):
         parse_mode="HTML",
         reply_markup=reset_confirm_keyboard(user_id, "votes")
     )
+
 
 # =========================
 # USER CALLBACKS
@@ -1619,6 +1712,7 @@ async def help_info_handler(callback: CallbackQuery):
     kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Orqaga"), callback_data="go_home"))
     await safe_edit_message(callback, get_help_text(user_id), kb.as_markup())
     await callback.answer()
+
 
 @dp.callback_query(F.data == "my_vote")
 async def my_vote_handler(callback: CallbackQuery):
@@ -1646,12 +1740,10 @@ async def my_ratings_handler(callback: CallbackQuery):
 async def go_complaint_panel_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     ensure_user(user_id)
-
     if not has_access(user_id):
         await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
         await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
         return
-
     WAITING_COMPLAINT_TEXT.add(user_id)
     await safe_edit_message(callback, get_complaint_intro_text(user_id), complaint_cancel_keyboard(user_id))
     await callback.answer()
@@ -1661,7 +1753,6 @@ async def go_complaint_panel_handler(callback: CallbackQuery):
 async def cancel_complaint_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     WAITING_COMPLAINT_TEXT.discard(user_id)
-
     if has_access(user_id):
         await safe_edit_message(callback, get_home_text(user_id), home_keyboard(user_id))
     else:
@@ -1681,31 +1772,26 @@ async def user_settings_handler(callback: CallbackQuery):
 async def set_script_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     ensure_user(user_id)
-
     script = callback.data.split(":", 1)[1]
     if script not in ("latin", "cyrillic"):
         await callback.answer("Xato", show_alert=True)
         return
-
     set_user_script(user_id, script)
     await safe_edit_message(callback, get_settings_text(user_id), settings_keyboard(user_id))
     await callback.answer(tr(user_id, "Yozuv turi saqlandi"))
+
 
 @dp.callback_query(F.data == "check_subscription")
 async def check_subscription_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     ensure_user(user_id)
-
     ok = await check_user_subscription(user_id)
     if not ok:
         reset_access(user_id)
         await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
         await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
         return
-
     grant_access(user_id)
-
-    # FIX #5: grant_access dan keyin keraksiz tekshiruv olib tashlandi
     await safe_edit_message(
         callback,
         "✅ <b>Obuna tasdiqlandi</b>\n\nEndi bosh menyudan bemalol foydalanishingiz mumkin:",
@@ -1717,14 +1803,11 @@ async def check_subscription_handler(callback: CallbackQuery):
 @dp.callback_query(F.data == "go_vote_panel")
 async def go_vote_panel_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
-
-    # Ovoz berishdan oldin obuna holati qayta tekshiriladi.
     if not await check_user_subscription(user_id):
         reset_access(user_id)
         await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
         await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
         return
-
     grant_access(user_id)
     if has_voted(user_id):
         await safe_edit_message(callback, get_already_voted_text(user_id), home_keyboard(user_id))
@@ -1736,6 +1819,7 @@ async def go_vote_panel_handler(callback: CallbackQuery):
         return
     await safe_edit_message(callback, get_subject_select_text(user_id), subjects_keyboard(user_id))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("subject:"))
 async def subject_select_handler(callback: CallbackQuery):
@@ -1758,6 +1842,7 @@ async def subject_select_handler(callback: CallbackQuery):
         return
     await safe_edit_message(callback, get_teacher_select_text(user_id, subject_key), teachers_keyboard(user_id, subject_key))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("vote:"))
 async def vote_handler(callback: CallbackQuery):
@@ -1825,7 +1910,7 @@ async def confirm_vote_handler(callback: CallbackQuery):
             full_name=callback.from_user.full_name or "Noma'lum",
             username=callback.from_user.username or "",
             subject_key=subject_key,
-            teacher_key=teacher_key
+            teacher_key=teacher_key,
         )
 
     if not saved:
@@ -1842,6 +1927,7 @@ async def confirm_vote_handler(callback: CallbackQuery):
     await safe_edit_message(callback, tr(user_id, text), after_vote_keyboard(user_id))
     await callback.answer(tr(user_id, "Ovozingiz qabul qilindi!"))
 
+
 # =========================
 # RATING CALLBACKS
 # =========================
@@ -1855,6 +1941,7 @@ async def go_rating_panel_handler(callback: CallbackQuery):
     await safe_edit_message(callback, get_rating_select_text(user_id), rating_subjects_keyboard(user_id))
     await callback.answer()
 
+
 @dp.callback_query(F.data.startswith("rating_subject:"))
 async def rating_subject_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -1864,6 +1951,7 @@ async def rating_subject_handler(callback: CallbackQuery):
         return
     await safe_edit_message(callback, get_rating_teacher_text(user_id, subject_key), rating_teachers_keyboard(user_id, subject_key))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("rating_teacher:"))
 async def rating_teacher_handler(callback: CallbackQuery):
@@ -1879,6 +1967,7 @@ async def rating_teacher_handler(callback: CallbackQuery):
         return
     await safe_edit_message(callback, get_rate_text(user_id, subject_key, teacher_key), rate_keyboard(user_id, subject_key, teacher_key))
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("rate:"))
 async def rate_handler(callback: CallbackQuery):
@@ -1897,10 +1986,16 @@ async def rate_handler(callback: CallbackQuery):
         return
 
     async with db_lock:
-        save_teacher_rating(user_id, callback.from_user.full_name or "Noma'lum", callback.from_user.username or "", subject_key, teacher_key, rating)
+        save_teacher_rating(
+            user_id,
+            callback.from_user.full_name or "Noma'lum",
+            callback.from_user.username or "",
+            subject_key, teacher_key, rating,
+        )
 
     await safe_edit_message(callback, get_rate_text(user_id, subject_key, teacher_key), rate_keyboard(user_id, subject_key, teacher_key))
     await callback.answer(tr(user_id, "Bahoyingiz saqlandi!"))
+
 
 # =========================
 # USER RESULTS
@@ -1911,6 +2006,7 @@ async def show_results_menu_user(callback: CallbackQuery):
     await safe_edit_message(callback, get_results_menu_text(user_id, False), results_menu_keyboard_user(user_id))
     await callback.answer()
 
+
 @dp.callback_query(F.data == "show_results_user:general")
 async def show_results_user_general(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -1919,19 +2015,17 @@ async def show_results_user_general(callback: CallbackQuery):
     await safe_edit_message(callback, text, results_keyboard_user(user_id, "general"))
     await callback.answer()
 
+
 @dp.callback_query(F.data.startswith("show_results_user:"))
 async def show_results_user(callback: CallbackQuery):
     user_id = callback.from_user.id
     scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
-
     if scope != "general" and scope not in SUBJECTS:
         await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
         return
-
     async with db_lock:
         text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
         text = add_refresh_time(text, user_id)
-
     await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
     await callback.answer()
 
@@ -1940,11 +2034,9 @@ async def show_results_user(callback: CallbackQuery):
 async def refresh_results_user_general(callback: CallbackQuery):
     user_id = callback.from_user.id
     refresh_key = "results_user:general"
-
     if not can_start_refresh(user_id, refresh_key):
         await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
         return
-
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
@@ -1953,27 +2045,23 @@ async def refresh_results_user_general(callback: CallbackQuery):
     finally:
         finish_refresh(user_id, refresh_key)
 
+
 @dp.callback_query(F.data.startswith("refresh_results_user:"))
 async def refresh_results_user(callback: CallbackQuery):
     user_id = callback.from_user.id
     scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
     refresh_key = f"results_user:{scope}"
-
     if not can_start_refresh(user_id, refresh_key):
         await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
         return
-
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-
         if scope != "general" and scope not in SUBJECTS:
             await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
             return
-
         async with db_lock:
             text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
             text = add_refresh_time(text, user_id)
-
         await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
     finally:
         finish_refresh(user_id, refresh_key)
@@ -1990,6 +2078,7 @@ async def back_admin_panel_callback(callback: CallbackQuery):
         return
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer()
+
 
 @dp.callback_query(F.data == "admin_results")
 async def admin_results_callback(callback: CallbackQuery):
@@ -2008,29 +2097,25 @@ async def show_results_admin_general(callback: CallbackQuery):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
     async with db_lock:
-        text = get_general_results_text(user_id)
-        text = add_refresh_time(text, user_id)
+        text = add_refresh_time(get_general_results_text(user_id), user_id)
     await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
     await callback.answer()
+
 
 @dp.callback_query(F.data == "refresh_results_admin:general")
 async def refresh_results_admin_general(callback: CallbackQuery):
     user_id = callback.from_user.id
     refresh_key = "results_admin:general"
-
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-
     if not can_start_refresh(user_id, refresh_key):
         await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
         return
-
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
-            text = get_general_results_text(user_id)
-            text = add_refresh_time(text, user_id)
+            text = add_refresh_time(get_general_results_text(user_id), user_id)
         await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
     finally:
         finish_refresh(user_id, refresh_key)
@@ -2042,16 +2127,13 @@ async def show_results_admin(callback: CallbackQuery):
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-
     scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
     if scope != "general" and scope not in SUBJECTS:
         await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
         return
-
     async with db_lock:
         text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
         text = add_refresh_time(text, user_id)
-
     await safe_edit_message(callback, text, results_keyboard_admin(user_id, scope))
     await callback.answer()
 
@@ -2059,28 +2141,22 @@ async def show_results_admin(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("refresh_results_admin:"))
 async def refresh_results_admin_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
-
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-
     scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
     refresh_key = f"results_admin:{scope}"
-
     if scope != "general" and scope not in SUBJECTS:
         await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
         return
-
     if not can_start_refresh(user_id, refresh_key):
         await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
         return
-
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
             text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
             text = add_refresh_time(text, user_id)
-
         await safe_edit_message(callback, text, results_keyboard_admin(user_id, scope))
     finally:
         finish_refresh(user_id, refresh_key)
@@ -2095,6 +2171,7 @@ async def admin_rating_stats_callback(callback: CallbackQuery):
     await safe_edit_message(callback, "⭐️ <b>Baholash foizlari</b>\n\nKerakli bo'limni tanlang:", rating_results_menu_keyboard_admin(user_id))
     await callback.answer()
 
+
 @dp.callback_query(F.data.startswith("show_rating_stats:"))
 async def show_rating_stats_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2107,21 +2184,18 @@ async def show_rating_stats_callback(callback: CallbackQuery):
     await safe_edit_message(callback, text, rating_stats_keyboard_admin(user_id, scope))
     await callback.answer()
 
+
 @dp.callback_query(F.data.startswith("refresh_rating_stats:"))
 async def refresh_rating_stats_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
-
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-
     scope = normalize_subject_key(callback.data.split(":", 1)[1])
     refresh_key = f"rating_stats:{scope}"
-
     if not can_start_refresh(user_id, refresh_key):
         await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
         return
-
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
@@ -2142,6 +2216,7 @@ async def admin_top_ratings_callback(callback: CallbackQuery):
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     await safe_edit_message(callback, get_top_ratings_text(user_id), kb.as_markup())
     await callback.answer()
+
 
 @dp.callback_query(F.data == "admin_teacher_stats")
 async def admin_teacher_stats_handler(callback: CallbackQuery):
@@ -2166,7 +2241,7 @@ async def teacher_stats_subject_handler(callback: CallbackQuery):
     await safe_edit_message(
         callback,
         tr(user_id, f"👤 <b>{get_subject_name(subject_key)}</b>\n\nStatistika uchun o'qituvchini tanlang:"),
-        teacher_stats_teachers_keyboard(user_id, subject_key)
+        teacher_stats_teachers_keyboard(user_id, subject_key),
     )
     await callback.answer()
 
@@ -2183,7 +2258,11 @@ async def teacher_stats_handler(callback: CallbackQuery):
         return
     _, subject_key, teacher_key = parts
     subject_key = normalize_subject_key(subject_key)
-    await safe_edit_message(callback, get_teacher_detailed_stats_text(user_id, subject_key, teacher_key), teacher_stats_keyboard(user_id, subject_key))
+    await safe_edit_message(
+        callback,
+        get_teacher_detailed_stats_text(user_id, subject_key, teacher_key),
+        teacher_stats_keyboard(user_id, subject_key),
+    )
     await callback.answer()
 
 
@@ -2199,7 +2278,7 @@ async def admin_backup_handler(callback: CallbackQuery):
             backup_path = create_backup_zip()
         await callback.message.answer_document(
             FSInputFile(backup_path),
-            caption="💾 Backup: votes.db, ovozlar Excel, rating Excel va shikoyatlar fayli."
+            caption="💾 Backup: ovozlar Excel, rating Excel va shikoyatlar fayli.",
         )
     except Exception as e:
         logging.error(f"Backup yaratishda xatolik: {e}")
@@ -2222,15 +2301,12 @@ async def admin_complaints_callback(callback: CallbackQuery):
 async def refresh_admin_complaints_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
     refresh_key = "admin_complaints"
-
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-
     if not can_start_refresh(user_id, refresh_key):
         await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
         return
-
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
@@ -2249,7 +2325,7 @@ async def admin_export_complaints_docx_callback(callback: CallbackQuery):
     filename = export_complaints_to_docx()
     await callback.message.answer_document(
         FSInputFile(filename),
-        caption="📄 Shikoyat va takliflar Word fayl ko'rinishida."
+        caption="📄 Shikoyat va takliflar Word fayl ko'rinishida.",
     )
     await callback.answer()
 
@@ -2265,19 +2341,17 @@ async def admin_users_callback(callback: CallbackQuery):
     await safe_edit_message(callback, text, users_keyboard_admin(user_id))
     await callback.answer()
 
+
 @dp.callback_query(F.data == "refresh_admin_users")
 async def refresh_admin_users(callback: CallbackQuery):
     user_id = callback.from_user.id
     refresh_key = "admin_users"
-
     if not is_admin(user_id):
         await callback.answer("Siz admin emassiz.", show_alert=True)
         return
-
     if not can_start_refresh(user_id, refresh_key):
         await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
         return
-
     try:
         await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
         async with db_lock:
@@ -2297,6 +2371,7 @@ async def admin_export_votes_excel_callback(callback: CallbackQuery):
     await callback.message.answer_document(FSInputFile(filename), caption="📁 Ovozlar Excel fayl ko'rinishida.")
     await callback.answer()
 
+
 @dp.callback_query(F.data == "admin_export_rating_excel")
 async def admin_export_rating_excel_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2306,6 +2381,7 @@ async def admin_export_rating_excel_callback(callback: CallbackQuery):
     filename = export_rating_to_excel()
     await callback.message.answer_document(FSInputFile(filename), caption="📁 Rating Excel fayl ko'rinishida.")
     await callback.answer()
+
 
 @dp.callback_query(F.data == "admin_open")
 async def admin_open_callback(callback: CallbackQuery):
@@ -2317,6 +2393,7 @@ async def admin_open_callback(callback: CallbackQuery):
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer("Voting ochildi!")
 
+
 @dp.callback_query(F.data == "admin_close")
 async def admin_close_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2327,6 +2404,7 @@ async def admin_close_callback(callback: CallbackQuery):
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer("Voting yopildi!")
 
+
 @dp.callback_query(F.data == "admin_reset_votes_confirm")
 async def admin_reset_votes_confirm_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2335,6 +2413,7 @@ async def admin_reset_votes_confirm_callback(callback: CallbackQuery):
         return
     await safe_edit_message(callback, "⚠️ <b>Diqqat!</b>\n\nBarcha ovozlar o'chiriladi.\nDavom etasizmi?", reset_confirm_keyboard(user_id, "votes"))
     await callback.answer()
+
 
 @dp.callback_query(F.data == "admin_reset_rating_confirm")
 async def admin_reset_rating_confirm_callback(callback: CallbackQuery):
@@ -2345,6 +2424,7 @@ async def admin_reset_rating_confirm_callback(callback: CallbackQuery):
     await safe_edit_message(callback, "⚠️ <b>Diqqat!</b>\n\nBarcha rating baholari o'chiriladi.\nDavom etasizmi?", reset_confirm_keyboard(user_id, "rating"))
     await callback.answer()
 
+
 @dp.callback_query(F.data == "admin_reset_complaints_confirm")
 async def admin_reset_complaints_confirm_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2354,9 +2434,10 @@ async def admin_reset_complaints_confirm_callback(callback: CallbackQuery):
     await safe_edit_message(
         callback,
         "⚠️ <b>Diqqat!</b>\n\nBarcha shikoyat va takliflar o'chiriladi.\nDavom etasizmi?",
-        reset_confirm_keyboard(user_id, "complaints")
+        reset_confirm_keyboard(user_id, "complaints"),
     )
     await callback.answer()
+
 
 @dp.callback_query(F.data == "admin_reset_complaints")
 async def admin_reset_complaints_callback(callback: CallbackQuery):
@@ -2369,6 +2450,7 @@ async def admin_reset_complaints_callback(callback: CallbackQuery):
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer("Shikoyat va takliflar tozalandi!")
 
+
 @dp.callback_query(F.data == "cancel_reset")
 async def cancel_reset_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -2377,6 +2459,7 @@ async def cancel_reset_callback(callback: CallbackQuery):
         return
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer(tr(user_id, "Bekor qilindi"))
+
 
 @dp.callback_query(F.data == "admin_reset_votes")
 async def admin_reset_votes_callback(callback: CallbackQuery):
@@ -2388,6 +2471,7 @@ async def admin_reset_votes_callback(callback: CallbackQuery):
         reset_votes()
     await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
     await callback.answer("Ovozlar reset qilindi!")
+
 
 @dp.callback_query(F.data == "admin_reset_rating")
 async def admin_reset_rating_callback(callback: CallbackQuery):
@@ -2401,22 +2485,21 @@ async def admin_reset_rating_callback(callback: CallbackQuery):
     await callback.answer("Rating reset qilindi!")
 
 
-# FIX #6: Keraksiz takroriy callbacklar olib tashlandi.
-# admin_complaints_word, admin_export_complaints_word, admin_export, admin_reset_confirm,
-# admin_reset — bular yo'q yoki birining nomi bilan almashtirilib qolgan edi.
-# Eski nomlar hali ham ishlashi kerak bo'lsa, quyida saqlanadi:
-
+# Eski callback nomlar bilan moslik
 @dp.callback_query(F.data == "admin_export")
 async def admin_export_callback(callback: CallbackQuery):
     await admin_export_votes_excel_callback(callback)
+
 
 @dp.callback_query(F.data == "admin_reset_confirm")
 async def admin_reset_confirm_old_callback(callback: CallbackQuery):
     await admin_reset_votes_confirm_callback(callback)
 
+
 @dp.callback_query(F.data == "admin_reset")
 async def admin_reset_old_callback(callback: CallbackQuery):
     await admin_reset_votes_callback(callback)
+
 
 # =========================
 # TEXT HANDLER
@@ -2448,7 +2531,7 @@ async def text_handler(message: Message):
         await message.answer(
             get_complaint_saved_text(user_id),
             parse_mode="HTML",
-            reply_markup=home_keyboard(user_id)
+            reply_markup=home_keyboard(user_id),
         )
         return
 
@@ -2456,7 +2539,7 @@ async def text_handler(message: Message):
         await message.answer(
             get_results_menu_text(user_id, False),
             parse_mode="HTML",
-            reply_markup=results_menu_keyboard_user(user_id)
+            reply_markup=results_menu_keyboard_user(user_id),
         )
 
 
@@ -2465,8 +2548,9 @@ async def text_handler(message: Message):
 # =========================
 async def main():
     init_db()
-    logging.info(f"Bot ishga tushdi. Baza: {DB_NAME}")
+    logging.info("Bot ishga tushdi. PostgreSQL baza ulandi.")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
