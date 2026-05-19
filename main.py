@@ -139,7 +139,7 @@ SUBJECTS = {
             "mbmt_1": "Irisova Sayyora Rajabovna",
             "mbmt_2": "Azizova Dilnoz Yo'ldoshevna",
             "mbmt_3": "G'oyimov Umar Eshmurodovich",
-            "mbmt_4": "Ziyoyeva Madina Mansur qizi",
+            "mbmt_4": "Ziyotova Madina Mansur qizi",
             "mbmt_5": "Karimova Umida Sharopovna",
             "mbmt_6": "Qarshiyeva Guzal Alimardonovna",
             "mbmt_7": "Qurbanova Xusnora Xudoyberdi qizi",
