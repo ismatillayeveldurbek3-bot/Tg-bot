@@ -85,7 +85,7 @@ SUBJECTS = {
             "pptm_1": "Umarov Lutfillo Murodilloyevich",
             "pptm_2": "Baratova Nasiba Turobovna",
             "pptm_3": "Bekmurodova Dilnoza Pirimovna",
-            "pptm_4": "Meyliyev Jobar Nurmatovna",
+            "pptm_4": "Meyliyev Lobar Nurmatovna",
             "pptm_5": "Ochilov Og'abek Narzullayevich",
             "pptm_6": "Shoniyozova Dilafruz Sabirovna",
             "pptm_7": "Yaratov Xamidjon Muxtorovich",
