@@ -98,7 +98,7 @@ SUBJECTS = {
         "name": "Aniq va tabiiy fanlar",
         "old_key": "aniq_va_tabiiy_fanlar",
         "teachers": {
-            "atf_1": "Jobborov Farhod Bo'rinevich",
+            "atf_1": "Jobborov Farhod Bo'riyevich",
             "atf_2": "Karimova Habiba Abduraxmonovna",
             "atf_3": "Quldoshova Maftuna Jumanzar qizi",
             "atf_4": "Mallaev Xamro Ro'ziboyevich",
@@ -2467,3 +2467,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
