@@ -58,6 +58,7 @@ DB_NAME = os.path.join(DATA_DIR, "votes.db")
 EXPORT_FILE = os.path.join(DATA_DIR, "votes_export.csv")
 VOTES_XLSX_FILE = os.path.join(DATA_DIR, "votes_export.xlsx")
 RATING_XLSX_FILE = os.path.join(DATA_DIR, "rating_export.xlsx")
+USERS_XLSX_FILE = os.path.join(DATA_DIR, "users_export.xlsx")
 # FIX #8: Ikki xil nom o'rniga bitta nom
 COMPLAINTS_DOCX_FILE = os.path.join(DATA_DIR, "complaints_export.docx")
 BACKUP_ZIP_FILE = os.path.join(DATA_DIR, "bot_backup.zip")
@@ -1015,12 +1016,13 @@ def create_backup_zip() -> str:
     conn.commit()
     votes_path = export_votes_to_excel()
     rating_path = export_rating_to_excel()
+    users_path = export_users_to_excel()
     complaints_path = export_complaints_to_docx()
 
     with zipfile.ZipFile(BACKUP_ZIP_FILE, "w", zipfile.ZIP_DEFLATED) as zf:
         if os.path.exists(DB_NAME):
             zf.write(DB_NAME, arcname="votes.db")
-        for path in (votes_path, rating_path, complaints_path):
+        for path in (votes_path, rating_path, users_path, complaints_path):
             if path and os.path.exists(path):
                 zf.write(path, arcname=os.path.basename(path))
     return BACKUP_ZIP_FILE
@@ -1126,6 +1128,101 @@ def export_rating_to_excel() -> str:
 
     wb.save(RATING_XLSX_FILE)
     return RATING_XLSX_FILE
+
+
+
+def export_users_to_excel() -> str:
+    """Barcha foydalanuvchilarni (user_prefs) Excel faylga eksport qiladi."""
+    if Workbook is None:
+        path = os.path.join(DATA_DIR, "users_export.csv")
+        cursor.execute("""
+            SELECT up.user_id, up.script, up.access_granted,
+                   v.full_name, v.username, v.subject_key, v.teacher_key, v.voted_at
+            FROM user_prefs up
+            LEFT JOIN votes v ON up.user_id = v.user_id
+            ORDER BY up.user_id
+        """)
+        rows = cursor.fetchall()
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["User ID", "Til", "Kirish", "Ism", "Username", "Kafedra", "O'qituvchi", "Ovoz sanasi"])
+            for row in rows:
+                uid, script, access, full_name, username, subject_key, teacher_key, voted_at = row
+                subject_key = normalize_subject_key(subject_key) if subject_key else ""
+                writer.writerow([
+                    uid, script, "Ha" if access else "Yo'q",
+                    full_name or "", username or "",
+                    get_subject_name(subject_key) if subject_key else "",
+                    get_teacher_name(subject_key, teacher_key) if subject_key and teacher_key else "",
+                    voted_at or ""
+                ])
+        return path
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # --- 1-varaq: Barcha foydalanuvchilar ---
+    ws_all = wb.create_sheet("Barcha foydalanuvchilar")
+    ws_append_header(ws_all, [
+        "User ID", "Til", "Kirish", "Ism", "Username",
+        "Kafedra", "O'qituvchi", "Ovoz sanasi"
+    ])
+    cursor.execute("""
+        SELECT up.user_id, up.script, up.access_granted,
+               v.full_name, v.username, v.subject_key, v.teacher_key, v.voted_at
+        FROM user_prefs up
+        LEFT JOIN votes v ON up.user_id = v.user_id
+        ORDER BY up.user_id
+    """)
+    all_rows = cursor.fetchall()
+    for uid, script, access, full_name, username, subject_key, teacher_key, voted_at in all_rows:
+        subject_key = normalize_subject_key(subject_key) if subject_key else ""
+        ws_all.append([
+            uid,
+            script or "latin",
+            "Ha" if access else "Yo'q",
+            full_name or "",
+            username or "",
+            get_subject_name(subject_key) if subject_key else "",
+            get_teacher_name(subject_key, teacher_key) if subject_key and teacher_key else "",
+            voted_at or ""
+        ])
+
+    # --- 2-varaq: Faqat ovoz berganlar ---
+    ws_voted = wb.create_sheet("Ovoz berganlar")
+    ws_append_header(ws_voted, [
+        "User ID", "Ism", "Username", "Kafedra", "O'qituvchi", "Ovoz sanasi"
+    ])
+    cursor.execute("""
+        SELECT user_id, full_name, username, subject_key, teacher_key, voted_at
+        FROM votes ORDER BY voted_at DESC
+    """)
+    for uid, full_name, username, subject_key, teacher_key, voted_at in cursor.fetchall():
+        subject_key = normalize_subject_key(subject_key)
+        ws_voted.append([
+            uid,
+            full_name or "",
+            username or "",
+            get_subject_name(subject_key),
+            get_teacher_name(subject_key, teacher_key),
+            voted_at or ""
+        ])
+
+    # --- 3-varaq: Hali ovoz bermaganlar ---
+    ws_not_voted = wb.create_sheet("Ovoz bermaganlar")
+    ws_append_header(ws_not_voted, ["User ID", "Til", "Kirish"])
+    cursor.execute("""
+        SELECT up.user_id, up.script, up.access_granted
+        FROM user_prefs up
+        LEFT JOIN votes v ON up.user_id = v.user_id
+        WHERE v.user_id IS NULL
+        ORDER BY up.user_id
+    """)
+    for uid, script, access in cursor.fetchall():
+        ws_not_voted.append([uid, script or "latin", "Ha" if access else "Yo'q"])
+
+    wb.save(USERS_XLSX_FILE)
+    return USERS_XLSX_FILE
 
 
 def export_complaints_to_word() -> str:
@@ -1498,8 +1595,9 @@ def users_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.row(
         InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="refresh_admin_users"),
-        InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel")
+        InlineKeyboardButton(text="📊 Excel", callback_data="admin_export_users_excel")
     )
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     return kb.as_markup()
 
 # =========================
@@ -2355,6 +2453,20 @@ async def admin_export_rating_excel_callback(callback: CallbackQuery):
         return
     filename = export_rating_to_excel()
     await callback.message.answer_document(FSInputFile(filename), caption="📁 Rating Excel fayl ko'rinishida.")
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_export_users_excel")
+async def admin_export_users_excel_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    async with db_lock:
+        filename = export_users_to_excel()
+    await callback.message.answer_document(
+        FSInputFile(filename),
+        caption="👥 Foydalanuvchilar Excel fayl ko'rinishida."
+    )
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_open")
