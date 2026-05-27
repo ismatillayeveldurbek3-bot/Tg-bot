@@ -875,6 +875,44 @@ def get_top_ratings_text(user_id: int) -> str:
     return tr(user_id, text[:4000] + ("\n\n... qisqartirildi" if len(text) > 4000 else ""))
 
 
+def get_top_votes_text(user_id: int) -> str:
+    """TOP 10 eng ko'p ovoz yiqqan o'qituvchilar ro'yxati."""
+    cursor.execute("""
+        SELECT subject_key, teacher_key, COUNT(*) as vote_count
+        FROM votes
+        GROUP BY subject_key, teacher_key
+        ORDER BY vote_count DESC
+        LIMIT 10
+    """)
+    rows = cursor.fetchall()
+
+    total_votes = get_total_votes()
+
+    if not rows:
+        return tr(user_id, "🥇 <b>TOP 10 — Eng ko'p ovoz yiqqan o'qituvchilar</b>\n\nHali hech kim ovoz bermagan.")
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    lines = [f"🥇 <b>TOP 10 — Eng ko'p ovoz yiqqan o'qituvchilar</b>\n\n🗳 Jami ovozlar: {total_votes}\n"]
+
+    for i, (subject_key, teacher_key, vote_count) in enumerate(rows):
+        subject_key = normalize_subject_key(subject_key)
+        teacher_name = get_teacher_name(subject_key, teacher_key)
+        subject_name = get_subject_name(subject_key)
+        percent = get_vote_percent(vote_count, total_votes)
+        bar = build_progress_bar(percent)
+        medal = medals[i] if i < len(medals) else f"{i+1}."
+        lines.append(
+            f"{medal} <b>{teacher_name}</b>\n"
+            f"   📂 {subject_name}\n"
+            f"   <code>{bar}</code> <b>{percent:.1f}%</b> • {vote_count} ta ovoz\n"
+        )
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n\n... qisqartirildi"
+    return tr(user_id, text)
+
+
 def get_users_text(user_id: int) -> str:
     cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
     rows = cursor.fetchall()
@@ -1404,6 +1442,7 @@ def admin_panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
     kb.row(InlineKeyboardButton(text="📊 Ovoz natijalari", callback_data="admin_results"))
     kb.row(InlineKeyboardButton(text="⭐️ Baholash foizlari", callback_data="admin_rating_stats"))
     kb.row(InlineKeyboardButton(text="🏆 TOP reytinglar", callback_data="admin_top_ratings"))
+    kb.row(InlineKeyboardButton(text="🥇 TOP 10 ovoz bo'yicha", callback_data="admin_top_votes"))
     kb.row(InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users"))
     kb.row(InlineKeyboardButton(text="👤 O'qituvchi statistikasi", callback_data="admin_teacher_stats"))
     kb.row(InlineKeyboardButton(text="📩 Shikoyat/takliflar", callback_data="admin_complaints"))
@@ -2138,6 +2177,20 @@ async def admin_top_ratings_callback(callback: CallbackQuery):
     kb.row(InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="admin_top_ratings"))
     kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
     await safe_edit_message(callback, get_top_ratings_text(user_id), kb.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_top_votes")
+async def admin_top_votes_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("Siz admin emassiz.", show_alert=True)
+        return
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="admin_top_votes"))
+    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
+    async with db_lock:
+        text = add_refresh_time(get_top_votes_text(user_id), user_id)
+    await safe_edit_message(callback, text, kb.as_markup())
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_teacher_stats")
