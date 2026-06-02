@@ -5,6 +5,7 @@ import json
 import asyncio
 import logging
 import sqlite3
+from functools import wraps
 from html import escape
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -116,8 +117,13 @@ async def answer_cb(call: CallbackQuery, text: str = ""):
 
 async def edit_or_send(target, text: str, reply_markup=None):
     if isinstance(target, CallbackQuery):
-        try: await target.message.edit_text(text, reply_markup=reply_markup)
-        except TelegramBadRequest: await target.message.answer(text, reply_markup=reply_markup)
+        try:
+            await target.message.edit_text(text, reply_markup=reply_markup)
+        except TelegramBadRequest:
+            await target.message.answer(text, reply_markup=reply_markup)
+        except Exception:
+            log.exception('edit_or_send failed, sending new message')
+            await target.message.answer(text, reply_markup=reply_markup)
     else:
         await target.answer(text, reply_markup=reply_markup)
 
@@ -462,6 +468,9 @@ async def reg_phone(m:Message,state:FSMContext):
 @dp.callback_query(F.data == 'rate:start')
 async def rate_start(call:CallbackQuery,state:FSMContext):
     await answer_cb(call)
+    await state.clear()
+    if not await check_sub(call.from_user.id):
+        return await call.answer('Avval kanalga obuna bo‘ling.', show_alert=True)
     if not setting_bool('voting_open','1'): return await call.answer('Baholash hozircha yopilgan.', show_alert=True)
     if not user_registered(call.from_user.id): return await start_registration(call,state,'rate')
     await edit_or_send(call, MOTIVATION, deps_kb('rate:dep','home'))
@@ -494,6 +503,7 @@ async def public_deps(call:CallbackQuery): await answer_cb(call); await edit_or_
 @dp.callback_query(F.data == 'complaint:start')
 async def complaint_start(call:CallbackQuery,state:FSMContext):
     await answer_cb(call)
+    await state.clear()
     if not user_registered(call.from_user.id): return await start_registration(call,state,'complaint')
     await state.set_state(ComplaintFSM.department); await edit_or_send(call,"Kafedrani tanlang:", deps_kb('complaint:dep','home'))
 @dp.callback_query(F.data.startswith('complaint:dep:'))
@@ -510,12 +520,28 @@ async def complaint_text(m:Message,state:FSMContext):
     if len(text)<5: return await m.answer("Shikoyat matni juda qisqa.")
     conn.execute("""INSERT INTO complaints(user_id,teacher_id,department_key,teacher_key,fullname,phone,username,complaint_text,message_text,created_at,status)
         VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (m.from_user.id,data['tkey'],data['dkey'],data['tkey'],u['fullname'] if u else '',u['phone'] if u else '',u['username'] if u else '',text,text,now_str(),'Yangi'))
-    conn.commit(); await state.clear(); await m.answer("✅ Shikoyatingiz saqlandi.", reply_markup=main_kb())
+    conn.commit()
+    await state.clear()
+    await m.answer("✅ Shikoyatingiz saqlandi. Tez orada ko‘rib chiqiladi.", reply_markup=ReplyKeyboardRemove())
+    await m.answer(home_text(), reply_markup=main_kb())
+    for admin_id in ADMIN_IDS:
+        try:
+            admin_note = (
+                f"📢 Yangi shikoyat\n"
+                f"O‘qituvchi: {safe(teacher_name(data['dkey'], data['tkey']))}\n"
+                f"Foydalanuvchi: {safe(u['fullname'] if u else '')}\n\n"
+                f"{text[:500]}"
+            )
+            await bot.send_message(admin_id, admin_note)
+        except Exception:
+            pass
+
 
 # =====================================================
 # ADMIN HANDLERS
 # =====================================================
 def admin_required(func):
+    @wraps(func)
     async def wrapper(event, *args, **kwargs):
         uid=event.from_user.id
         if not is_admin(uid):
@@ -836,10 +862,42 @@ async def backup_cmd(m:Message): path=make_backup(); await m.answer_document(FSI
 async def export_cmd(m:Message): path=export_all_excel(); await m.answer_document(FSInputFile(path), caption='Excel export')
 
 # fallback buttons from old bot
-@dp.message(F.text.in_({'📝 O‘qituvchini baholash','📝 Baholash'}))
-async def msg_rate(m:Message,state:FSMContext): ensure_user_obj(m); await start_registration(m,state,'rate') if not user_registered(m.from_user.id) else await m.answer(MOTIVATION,reply_markup=deps_kb('rate:dep','home'))
-@dp.message(F.text.in_({'📢 Shikoyat yuborish','📢 Shikoyat'}))
-async def msg_complaint(m:Message,state:FSMContext): ensure_user_obj(m); await start_registration(m,state,'complaint') if not user_registered(m.from_user.id) else await m.answer('Kafedrani tanlang:',reply_markup=deps_kb('complaint:dep','home'))
+@dp.message(F.text.in_({'📝 O‘qituvchini baholash','📝 Baholash','🗳 Ovoz berish','Ovoz berish','Baholash'}))
+async def msg_rate(m:Message,state:FSMContext):
+    await state.clear(); ensure_user_obj(m)
+    if not setting_bool('voting_open','1'):
+        return await m.answer('Baholash hozircha yopilgan.')
+    await start_registration(m,state,'rate') if not user_registered(m.from_user.id) else await m.answer(MOTIVATION,reply_markup=deps_kb('rate:dep','home'))
+@dp.message(F.text.in_({'📢 Shikoyat yuborish','📢 Shikoyat','Shikoyat yuborish'}))
+async def msg_complaint(m:Message,state:FSMContext):
+    await state.clear(); ensure_user_obj(m)
+    await start_registration(m,state,'complaint') if not user_registered(m.from_user.id) else await m.answer('Kafedrani tanlang:',reply_markup=deps_kb('complaint:dep','home'))
+
+
+@dp.message(Command('cancel'))
+async def cancel_cmd(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer('Jarayon bekor qilindi.', reply_markup=ReplyKeyboardRemove())
+    await m.answer(home_text(), reply_markup=main_kb())
+
+@dp.callback_query(F.data == 'admin:settings')
+@admin_required
+async def adm_settings_duplicate_guard(call:CallbackQuery):
+    # This guard is intentionally unreachable if the main settings handler is registered;
+    # kept only for old deployments with partial reloads.
+    await answer_cb(call)
+    await edit_or_send(call,"⚙️ <b>Sozlamalar</b>",admin_settings_kb())
+
+@dp.callback_query(F.data.startswith('admin:'))
+@admin_required
+async def unknown_admin_callback(call: CallbackQuery):
+    await answer_cb(call)
+    await edit_or_send(call, '<b>Admin panel</b>\nBu tugma uchun bo‘lim qayta ochildi.', admin_kb())
+
+@dp.callback_query(F.data.startswith('rate:'))
+async def unknown_rate_callback(call: CallbackQuery):
+    await answer_cb(call)
+    await edit_or_send(call, MOTIVATION, deps_kb('rate:dep','home'))
 
 @dp.errors()
 async def errors_handler(event):
