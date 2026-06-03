@@ -201,7 +201,7 @@ def init_db():
         if not col_exists("teachers", col): c.execute(ddl)
     for col, ddl in [("phone", "ALTER TABLE users ADD COLUMN phone TEXT"), ("is_blocked", "ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0")]:
         if not col_exists("users", col): c.execute(ddl)
-    for col, ddl in [("department_key", "ALTER TABLE complaints ADD COLUMN department_key TEXT"), ("teacher_key", "ALTER TABLE complaints ADD COLUMN teacher_key TEXT"), ("teacher_id", "ALTER TABLE complaints ADD COLUMN teacher_id TEXT"), ("phone", "ALTER TABLE complaints ADD COLUMN phone TEXT"), ("complaint_text", "ALTER TABLE complaints ADD COLUMN complaint_text TEXT"), ("status", "ALTER TABLE complaints ADD COLUMN status TEXT DEFAULT 'Yangi'")]:
+    for col, ddl in [("user_id", "ALTER TABLE complaints ADD COLUMN user_id INTEGER"), ("teacher_id", "ALTER TABLE complaints ADD COLUMN teacher_id TEXT"), ("department_key", "ALTER TABLE complaints ADD COLUMN department_key TEXT"), ("teacher_key", "ALTER TABLE complaints ADD COLUMN teacher_key TEXT"), ("fullname", "ALTER TABLE complaints ADD COLUMN fullname TEXT"), ("phone", "ALTER TABLE complaints ADD COLUMN phone TEXT"), ("username", "ALTER TABLE complaints ADD COLUMN username TEXT"), ("complaint_text", "ALTER TABLE complaints ADD COLUMN complaint_text TEXT"), ("message_text", "ALTER TABLE complaints ADD COLUMN message_text TEXT"), ("created_at", "ALTER TABLE complaints ADD COLUMN created_at TEXT"), ("status", "ALTER TABLE complaints ADD COLUMN status TEXT DEFAULT 'Yangi'")]:
         if not col_exists("complaints", col): c.execute(ddl)
     for col, ddl in [("fullname", "ALTER TABLE suggestions ADD COLUMN fullname TEXT"), ("phone", "ALTER TABLE suggestions ADD COLUMN phone TEXT"), ("username", "ALTER TABLE suggestions ADD COLUMN username TEXT"), ("suggestion_text", "ALTER TABLE suggestions ADD COLUMN suggestion_text TEXT"), ("created_at", "ALTER TABLE suggestions ADD COLUMN created_at TEXT"), ("status", "ALTER TABLE suggestions ADD COLUMN status TEXT DEFAULT 'Yangi'")]:
         if not col_exists("suggestions", col): c.execute(ddl)
@@ -353,7 +353,7 @@ def rating_stars_kb(dkey,tkey):
 def phone_kb(): return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='📱 Telefon raqamni yuborish', request_contact=True)], [KeyboardButton(text='❌ Bekor qilish')]], resize_keyboard=True, one_time_keyboard=True)
 
 def admin_teachers_kb(): return ik([[('➕ Qo‘shish','tm:add'),('📋 Ro‘yxat','tm:list')],[('🔍 Qidirish','tm:search'),('👥 O‘quvchilar soni','tm:students')],[('🏛 Kafedralar','dep:manage')],[('⬅️ Admin','admin:menu')]])
-def admin_settings_kb(): return ik([[('👨‍🏫 O‘qituvchilar','admin:teachers'),('🏛 Kafedralar','set:deps')],[('📢 Shikoyatlar','set:complaints'),('🗳 Baholash','set:voting')],[('📊 Reyting','set:rating'),('🔐 Adminlar','set:admins')],[('📦 Backup','set:backup')],[('⬅️ Admin','admin:menu')]])
+def admin_settings_kb(): return ik([[('🏛 Kafedralar','set:deps'),('📢 Shikoyatlar','set:complaints')],[('🗳 Baholash','set:voting'),('📊 Reyting','set:rating')],[('🔐 Adminlar','set:admins'),('📦 Backup','set:backup')],[('⬅️ Admin','admin:menu')]])
 
 # =====================================================
 # TEXTS
@@ -563,24 +563,38 @@ async def complaint_teacher(call:CallbackQuery,state:FSMContext):
     await ask_input(call, f"<b>{safe(teacher_name(dkey,tkey))}</b> ustidan shikoyat matnini yozing:")
 @dp.message(ComplaintFSM.text)
 async def complaint_text(m:Message,state:FSMContext):
-    data=await state.get_data(); u=get_user(m.from_user.id); text=(m.text or '').strip()
+    text=(m.text or '').strip()
+    if not text:
+        return await m.answer("Iltimos, shikoyat matnini oddiy xabar ko‘rinishida yozing.", reply_markup=cancel_kb())
     if len(text)<5:
         return await m.answer("Shikoyat matni juda qisqa. Iltimos, batafsilroq yozing.", reply_markup=cancel_kb())
+    data=await state.get_data()
     dkey=data.get('dkey'); tkey=data.get('tkey')
     if not dkey or not tkey:
         await state.clear()
         await m.answer("Jarayonda xatolik bo‘ldi. Iltimos, qaytadan urinib ko‘ring.", reply_markup=ReplyKeyboardRemove())
         return await m.answer(home_text(), reply_markup=main_kb())
-    conn.execute("""INSERT INTO complaints(user_id,teacher_id,department_key,teacher_key,fullname,phone,username,complaint_text,message_text,created_at,status)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (m.from_user.id,tkey,dkey,tkey,u['fullname'] if u else '',u['phone'] if u else '',u['username'] if u else '',text,text,now_str(),'Yangi'))
-    conn.commit()
+    u=get_user(m.from_user.id)
+    fullname = u['fullname'] if u and 'fullname' in u.keys() else (m.from_user.full_name or '')
+    phone = u['phone'] if u and 'phone' in u.keys() else ''
+    username = u['username'] if u and 'username' in u.keys() else (m.from_user.username or '')
+    try:
+        conn.execute("""INSERT INTO complaints(user_id,teacher_id,department_key,teacher_key,fullname,phone,username,complaint_text,message_text,created_at,status)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (m.from_user.id,tkey,dkey,tkey,fullname,phone,username,text,text,now_str(),'Yangi'))
+        conn.commit()
+    except Exception:
+        log.exception("Complaint save failed")
+        await state.clear()
+        await m.answer("Shikoyatni saqlashda xatolik bo‘ldi. Iltimos, keyinroq qayta urinib ko‘ring.", reply_markup=ReplyKeyboardRemove())
+        return await m.answer(home_text(), reply_markup=main_kb())
     await state.clear()
     await m.answer("✅ Shikoyatingiz saqlandi. Tez orada ko‘rib chiqiladi.", reply_markup=ReplyKeyboardRemove())
     await m.answer(home_text(), reply_markup=main_kb())
     admin_note = (
         f"📢 Yangi shikoyat\n"
         f"O‘qituvchi: {safe(teacher_name(dkey, tkey))}\n"
-        f"Foydalanuvchi: {safe(u['fullname'] if u else '')} | {safe(u['phone'] if u else '')}\n\n"
+        f"Kafedra: {safe(dep_name(dkey))}\n"
+        f"Foydalanuvchi: {safe(fullname)} | {safe(phone)}\n\n"
         f"{safe(text[:1000])}"
     )
     asyncio.create_task(notify_admins(admin_note))
@@ -672,7 +686,7 @@ async def tm_adddep(call:CallbackQuery,state:FSMContext): await answer_cb(call);
 @admin_required
 async def tm_addname(m:Message,state:FSMContext):
     data=await state.get_data(); name=(m.text or '').strip()
-    if len(name)<3: return await m.answer('F.I.Sh juda qisqa.')
+    if len(name)<3: return await m.answer('F.I.Sh juda qisqa.', reply_markup=cancel_kb())
     key=slug(name,'t')
     conn.execute("INSERT OR IGNORE INTO teachers(teacher_key,department_key,name,created_at) VALUES(?,?,?,?)",(key,data['dkey'],name,now_str())); conn.commit(); await state.clear(); await m.answer("✅ O‘qituvchi qo‘shildi.",reply_markup=admin_teachers_kb())
 @dp.callback_query(F.data == 'tm:students')
@@ -739,7 +753,7 @@ async def tm_edit_name_start(call:CallbackQuery,state:FSMContext):
 @admin_required
 async def tm_edit_name_save(m:Message,state:FSMContext):
     name=(m.text or '').strip()
-    if len(name)<3: return await m.answer("Nom juda qisqa.")
+    if len(name)<3: return await m.answer("Nom juda qisqa.", reply_markup=cancel_kb())
     data=await state.get_data(); conn.execute("UPDATE teachers SET name=? WHERE department_key=? AND teacher_key=?",(name,data['dkey'],data['tkey'])); conn.commit(); await state.clear()
     await m.answer("✅ O‘qituvchi nomi yangilandi.", reply_markup=admin_teachers_kb())
 
@@ -775,7 +789,7 @@ async def restore_teacher(call:CallbackQuery):
 @admin_required
 async def dep_manage(call:CallbackQuery):
     await answer_cb(call)
-    await edit_or_send(call,"🏛 <b>Kafedralar boshqaruvi</b>",ik([[('➕ Qo‘shish','dep:add'),('📋 Ro‘yxat','dep:list')],[('⬅️ O‘qituvchilar','admin:teachers')]]))
+    await edit_or_send(call,"🏛 <b>Kafedralar boshqaruvi</b>",ik([[('➕ Qo‘shish','dep:add'),('📋 Ro‘yxat','dep:list')],[('⬅️ Admin','admin:menu')]]))
 
 @dp.callback_query(F.data == 'dep:list')
 @admin_required
@@ -802,7 +816,7 @@ async def dep_add_start(call:CallbackQuery,state:FSMContext):
 @admin_required
 async def dep_add_save(m:Message,state:FSMContext):
     name=(m.text or '').strip()
-    if len(name)<3: return await m.answer("Nom juda qisqa.")
+    if len(name)<3: return await m.answer("Nom juda qisqa.", reply_markup=cancel_kb())
     key=slug(name,'d'); order=conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM departments").fetchone()[0]
     conn.execute("INSERT INTO departments(department_key,name,sort_order,created_at) VALUES(?,?,?,?)",(key,name,order,now_str())); conn.commit(); await state.clear()
     await m.answer("✅ Kafedra qo‘shildi.", reply_markup=admin_teachers_kb())
@@ -817,7 +831,7 @@ async def dep_edit_start(call:CallbackQuery,state:FSMContext):
 @admin_required
 async def dep_edit_save(m:Message,state:FSMContext):
     name=(m.text or '').strip()
-    if len(name)<3: return await m.answer("Nom juda qisqa.")
+    if len(name)<3: return await m.answer("Nom juda qisqa.", reply_markup=cancel_kb())
     data=await state.get_data(); conn.execute("UPDATE departments SET name=? WHERE department_key=?",(name,data['dkey'])); conn.commit(); await state.clear()
     await m.answer("✅ Kafedra yangilandi.", reply_markup=admin_teachers_kb())
 
@@ -1002,6 +1016,12 @@ async def adm_settings_duplicate_guard(call:CallbackQuery):
     # kept only for old deployments with partial reloads.
     await answer_cb(call)
     await edit_or_send(call,"⚙️ <b>Sozlamalar</b>",admin_settings_kb())
+
+@dp.callback_query(F.data.startswith('set:'))
+@admin_required
+async def unknown_settings_callback(call: CallbackQuery):
+    await answer_cb(call)
+    await edit_or_send(call, "⚙️ <b>Sozlamalar</b>\nBu tugma uchun sozlamalar oynasi qayta ochildi.", admin_settings_kb())
 
 @dp.callback_query(F.data.startswith('admin:'))
 @admin_required
