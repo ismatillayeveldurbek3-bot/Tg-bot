@@ -1,3241 +1,1037 @@
 import os
-import csv
 import re
+import csv
+import json
 import asyncio
 import logging
 import sqlite3
-import zipfile
-from datetime import datetime, timezone, timedelta
+from functools import wraps
 from html import escape
-from typing import Optional
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Iterable
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ChatMemberStatus
-from aiogram.filters import Command
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    FSInputFile,
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, FSInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.client.default import DefaultBotProperties
 
 try:
     from openpyxl import Workbook
-except ImportError:
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+except Exception:  # pragma: no cover
     Workbook = None
 
 try:
-    from docx import Document
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.shared import Pt
-except ImportError:
-    Document = None
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+except Exception:  # pragma: no cover
+    AsyncIOScheduler = None
 
-# =========================
-# SOZLAMALAR
-# =========================
-# FIX #1: Token faqat env dan olinadi, kodga yozilmaydi
+# =====================================================
+# CONFIG
+# =====================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN muhit o'zgaruvchisi topilmadi. Iltimos, BOT_TOKEN ni o'rnating.")
+    raise RuntimeError("BOT_TOKEN env o'zgaruvchisi topilmadi.")
 
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@Qashqadaryo_PMM")
-CHANNEL_URL = "https://t.me/Qashqadaryo_PMM"
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/Qashqadaryo_PMM")
+FACEBOOK_URL = os.getenv("FACEBOOK_URL", "https://www.facebook.com/share/1E4ZVePTh4/")
+INSTAGRAM_URL = os.getenv("INSTAGRAM_URL", "https://www.instagram.com/pedagogikmahorat")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "5298063089,7361393654").replace(";", ",").split(",") if x.strip().isdigit()]
 
-ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "5298063089,7361393654")
-ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip().isdigit()]
+DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "votes.db"
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+UZ_TZ = timezone(timedelta(hours=5), name="Asia/Tashkent")
 
-FACEBOOK_URL = "https://www.facebook.com/share/1E4ZVePTh4/"
-INSTAGRAM_URL = "https://www.instagram.com/pedagogikmahorat"
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("rating-bot")
 
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-DB_NAME = os.path.join(DATA_DIR, "votes.db")
-EXPORT_FILE = os.path.join(DATA_DIR, "votes_export.csv")
-VOTES_XLSX_FILE = os.path.join(DATA_DIR, "votes_export.xlsx")
-RATING_XLSX_FILE = os.path.join(DATA_DIR, "rating_export.xlsx")
-USERS_XLSX_FILE = os.path.join(DATA_DIR, "users_export.xlsx")
-# FIX #8: Ikki xil nom o'rniga bitta nom
-COMPLAINTS_DOCX_FILE = os.path.join(DATA_DIR, "complaints_export.docx")
-BACKUP_ZIP_FILE = os.path.join(DATA_DIR, "bot_backup.zip")
-
+# =====================================================
+# INITIAL DATA / BACKWARD COMPATIBILITY
+# =====================================================
 SUBJECTS = {
-    "s1": {
-        "name": "Tillarni o'qitish metodikasi",
-        "old_key": "tillarni_oqitish_metodikasi",
-        "teachers": {
-            "tom_1": "Norov Otajon Shomurodovich",
-            "tom_2": "Abdixolikov Abdulazizxon Abduvohob o'g'li",
-            "tom_3": "Azimova Nigora Anvar qizi",
-            "tom_4": "Abatov Doston Ro'zimurod o'g'li",
-            "tom_5": "Jalilova Komila Abdullayevna",
-            "tom_6": "Oqboyeva Zulfiya Bobonazarovna",
-            "tom_7": "Sevastyanova Nadejda Aleksandrovna",
-            "tom_8": "Xidirova Feruza To'rayevna",
-            "tom_9": "Ergasheva Dilorom Muradilloyevna",
-        },
-    },
-    "s2": {
-        "name": "Pedagogika, psixologiya va ta'lim menejmenti",
-        "old_key": "pedagogika_psixologiya_va_talim_menejmenti",
-        "teachers": {
-            "pptm_1": "Umarov Lutfillo Murodilloyevich",
-            "pptm_2": "Baratova Nasiba Turobovna",
-            "pptm_3": "Bekmurodova Dilnoza Pirimovna",
-            "pptm_4": "Meyliyev Lobar Nurmatovna",
-            "pptm_5": "Ochilov Og'abek Narzullayevich",
-            "pptm_6": "Shoniyozova Dilafruz Sabirovna",
-            "pptm_7": "Yaratov Xamidjon Muxtorovich",
-            "pptm_8": "Nazarov Asliddin Faxriddin o'g'li",
-            "pptm_9": "Ergasheva Dilafruz Ergamqulovna",
-            "pptm_10": "Soatov Asadulloh Jabborovich",
-        },
-    },
-    "s3": {
-        "name": "Aniq va tabiiy fanlar",
-        "old_key": "aniq_va_tabiiy_fanlar",
-        "teachers": {
-            "atf_1": "Jobborov Farhod Bo'riyevich",
-            "atf_2": "Karimova Habiba Abduraxmonovna",
-            "atf_3": "Quldoshova Maftuna Jumanzar qizi",
-            "atf_4": "Mallaev Xamro Ro'ziboyevich",
-            "atf_5": "Mamatov Bekzod Farxotovich",
-            "atf_6": "Pardaeva Muqaddas Zafar qizi",
-            "atf_7": "Parmanov Jahongir Rayhonovich",
-            "atf_8": "Rahmatullayev Erkin Shokirovich",
-            "atf_9": "Suyarov Zoir Shojmardonovich",
-            "atf_10": "Tursunova Maftuna Sulton qizi",
-            "atf_11": "Umarov Ibrohimxon Norxuja o'g'li",
-            "atf_12": "Chariev Rashid Ravshanovich",
-            "atf_13": "Elmurodov Sherdil Ergashyevich",
-            "atf_14": "Eshmonov Laziz Norxo'rja o'g'li",
-            "atf_15": "Karaeva Dilfuzaxon Mamasharipovna",
-            "atf_16": "Salomova Madina Sodiq qizi",
-        },
-    },
-    "s4": {
-        "name": "Amaliy va ijtimoiy fanlar",
-        "old_key": "amaliy_va_ijtimoiy_fanlar",
-        "teachers": {
-            "aif_1": "Yo'ldashev Bekmirza Elmurodovich",
-            "aif_2": "Jabboborov Laziz Hamza o'g'li",
-            "aif_3": "Nurmatov Samandar Fayratovich",
-            "aif_4": "Batoshov Inatillo Kungirovich",
-            "aif_5": "Rajabov Ruslan Bozorovich",
-            "aif_6": "Sanaev Azamat Alponovich",
-            "aif_7": "Shamsiev Jahongir Qulmurod o'g'li",
-            "aif_8": "Xudoyberdiev Axrorboy Nabi o'g'li",
-            "aif_9": "Xasanova Gulnora Qorshanbiyevna",
-            "aif_10": "Eshnazarova Maziya Allanazarovna",
-        },
-    },
-    "s5": {
-        "name": "Maktabgacha, boshlang'ich va maxsus ta'lim",
-        "old_key": "maktabgacha_boshlangich_va_maxsus_talim",
-        "teachers": {
-            "mbmt_1": "Irisova Sayyora Rajabovna",
-            "mbmt_2": "Azizova Dilnoz Yo'ldoshevna",
-            "mbmt_3": "G'oyimov Umar Eshmurodovich",
-            "mbmt_4": "Ziyotova Madina Mansur qizi",
-            "mbmt_5": "Karimova Umida Sharopovna",
-            "mbmt_6": "Qarshiyeva Guzal Alimardonovna",
-            "mbmt_7": "Qurbanova Xusnora Xudoyberdi qizi",
-            "mbmt_8": "Rajabova Xurshida Hakimovna",
-            "mbmt_9": "Razzaqova Dilnoza Akramovna",
-            "mbmt_10": "Sadinova Marjona Akmal qizi",
-            "mbmt_11": "Shaxmurodova Dilxaxon Almardanovna",
-            "mbmt_12": "Ergasheva Xusniya Mirzoxid qizi",
-            "mbmt_13": "Zaripova Muslima Qurbonovna",
-        },
-    },
+    "s1": {"name": "Tillarni o'qitish metodikasi", "old_key": "tillarni_oqitish_metodikasi", "teachers": {
+        "tom_1": "Norov Otajon Shomurodovich", "tom_2": "Abdixolikov Abdulazizxon Abduvohob o'g'li", "tom_3": "Azimova Nigora Anvar qizi", "tom_4": "Abatov Doston Ro'zimurod o'g'li", "tom_5": "Jalilova Komila Abdullayevna", "tom_6": "Oqboyeva Zulfiya Bobonazarovna", "tom_7": "Sevastyanova Nadejda Aleksandrovna", "tom_8": "Xidirova Feruza To'rayevna", "tom_9": "Ergasheva Dilorom Muradilloyevna"}},
+    "s2": {"name": "Pedagogika, psixologiya va ta'lim menejmenti", "old_key": "pedagogika_psixologiya_va_talim_menejmenti", "teachers": {
+        "pptm_1": "Umarov Lutfillo Murodilloyevich", "pptm_2": "Baratova Nasiba Turobovna", "pptm_3": "Bekmurodova Dilnoza Pirimovna", "pptm_4": "Meyliyev Lobar Nurmatovna", "pptm_5": "Ochilov Og'abek Narzullayevich", "pptm_6": "Shoniyozova Dilafruz Sabirovna", "pptm_7": "Yaratov Xamidjon Muxtorovich", "pptm_8": "Nazarov Asliddin Faxriddin o'g'li", "pptm_9": "Ergasheva Dilafruz Ergamqulovna", "pptm_10": "Soatov Asadulloh Jabborovich"}},
+    "s3": {"name": "Aniq va tabiiy fanlar", "old_key": "aniq_va_tabiiy_fanlar", "teachers": {
+        "atf_1": "Jobborov Farhod Bo'riyevich", "atf_2": "Karimova Habiba Abduraxmonovna", "atf_3": "Quldoshova Maftuna Jumanzar qizi", "atf_4": "Mallaev Xamro Ro'ziboyevich", "atf_5": "Mamatov Bekzod Farxotovich", "atf_6": "Pardaeva Muqaddas Zafar qizi", "atf_7": "Parmanov Jahongir Rayhonovich", "atf_8": "Rahmatullayev Erkin Shokirovich", "atf_9": "Suyarov Zoir Shojmardonovich", "atf_10": "Tursunova Maftuna Sulton qizi", "atf_11": "Umarov Ibrohimxon Norxuja o'g'li", "atf_12": "Chariev Rashid Ravshanovich", "atf_13": "Elmurodov Sherdil Ergashyevich", "atf_14": "Eshmonov Laziz Norxo'rja o'g'li", "atf_15": "Karaeva Dilfuzaxon Mamasharipovna", "atf_16": "Salomova Madina Sodiq qizi"}},
+    "s4": {"name": "Amaliy va ijtimoiy fanlar", "old_key": "amaliy_va_ijtimoiy_fanlar", "teachers": {
+        "aif_1": "Yo'ldashev Bekmirza Elmurodovich", "aif_2": "Jabboborov Laziz Hamza o'g'li", "aif_3": "Nurmatov Samandar Fayratovich", "aif_4": "Batoshov Inatillo Kungirovich", "aif_5": "Rajabov Ruslan Bozorovich", "aif_6": "Sanaev Azamat Alponovich", "aif_7": "Shamsiev Jahongir Qulmurod o'g'li", "aif_8": "Xudoyberdiev Axrorboy Nabi o'g'li", "aif_9": "Xasanova Gulnora Qorshanbiyevna", "aif_10": "Eshnazarova Maziya Allanazarovna"}},
+    "s5": {"name": "Maktabgacha, boshlang'ich va maxsus ta'lim", "old_key": "maktabgacha_boshlangich_va_maxsus_talim", "teachers": {
+        "mbmt_1": "Irisova Sayyora Rajabovna", "mbmt_2": "Azizova Dilnoz Yo'ldoshevna", "mbmt_3": "G'oyimov Umar Eshmurodovich", "mbmt_4": "Ziyotova Madina Mansur qizi", "mbmt_5": "Karimova Umida Sharopovna", "mbmt_6": "Qarshiyeva Guzal Alimardonovna", "mbmt_7": "Qurbanova Xusnora Xudoyberdi qizi", "mbmt_8": "Rajabova Xurshida Hakimovna", "mbmt_9": "Razzaqova Dilnoza Akramovna", "mbmt_10": "Sadinova Marjona Akmal qizi", "mbmt_11": "Shaxmurodova Dilxaxon Almardanovna", "mbmt_12": "Ergasheva Xusniya Mirzoxid qizi", "mbmt_13": "Zaripova Muslima Qurbonovna"}},
 }
 OLD_TO_NEW_SUBJECT = {v["old_key"]: k for k, v in SUBJECTS.items()}
 
-logging.basicConfig(level=logging.INFO)
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-cursor = conn.cursor()
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn.row_factory = sqlite3.Row
 db_lock = asyncio.Lock()
-WAITING_COMPLAINT_TEXT = set()
-COMPLAINT_COOLDOWN_SECONDS = 300
-ADMIN_MANAGE_STATE = {}  # {user_id: {action, data}}
-COMPLAINT_MAX_LENGTH = 1000
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
 
-# Refresh tugmalarini ketma-ket bosishdan himoya
-LAST_REFRESH = {}
-REFRESH_BUSY = set()
-REFRESH_COOLDOWN_SECONDS = 1.5
+# =====================================================
+# FSM
+# =====================================================
+class Register(StatesGroup):
+    first_name = State(); last_name = State(); phone = State(); after = State()
+class ComplaintFSM(StatesGroup):
+    department = State(); teacher = State(); text = State()
+class SuggestionFSM(StatesGroup):
+    text = State()
+class TeacherFSM(StatesGroup):
+    add_department = State(); add_name = State(); edit_name = State(); student_count = State(); search = State()
+class TeacherEditFSM(StatesGroup):
+    name = State(); student_count = State()
+class DepartmentFSM(StatesGroup):
+    add_name = State(); edit_name = State(); sort_order = State()
+class AdminFSM(StatesGroup):
+    broadcast = State(); admin_add = State(); admin_remove = State()
 
+# =====================================================
+# HELPERS
+# =====================================================
+def now_str() -> str: return datetime.now(UZ_TZ).strftime("%Y-%m-%d %H:%M:%S")
+def is_admin(uid: int) -> bool: return uid in ADMIN_IDS or str(uid) in get_setting("extra_admins", "").split(",")
+def safe(s: Optional[str]) -> str: return escape(s or "")
+def slug(text: str, prefix: str = "id") -> str:
+    # Latin/Cyrillic/Uzbek apostroflar bilan kelgan ismlarni xavfsiz keyga aylantiradi
+    base = re.sub(r"[^a-zA-Z0-9_]+", "_", (text or "").lower()).strip("_")[:24]
+    return f"{prefix}_{base or int(datetime.now().timestamp())}_{int(datetime.now().timestamp()*1000)%100000}"
+def setting_bool(key: str, default="1") -> bool: return get_setting(key, default) == "1"
 
-# =========================
-# O'ZBEKISTON VAQTI
-# =========================
-UZ_TZ = timezone(timedelta(hours=5), name="Asia/Tashkent")
+async def answer_cb(call: CallbackQuery, text: str = ""):
+    try: await call.answer(text)
+    except TelegramBadRequest: pass
 
-def uz_now() -> datetime:
-    return datetime.now(UZ_TZ)
+async def edit_or_send(target, text: str, reply_markup=None):
+    if isinstance(target, CallbackQuery):
+        try:
+            await target.message.edit_text(text, reply_markup=reply_markup)
+        except TelegramBadRequest:
+            await target.message.answer(text, reply_markup=reply_markup)
+        except Exception:
+            log.exception('edit_or_send failed, sending new message')
+            await target.message.answer(text, reply_markup=reply_markup)
+    else:
+        await target.answer(text, reply_markup=reply_markup)
 
-# =========================
-# LOTIN / KRILL
-# =========================
-def latin_to_cyrillic_text(text: str) -> str:
-    # FIX #4: Takrorlangan juftlar olib tashlandi, to'g'ri tartib saqlandi
-    pairs = [
-        ("O\u2018", "\u040e"), ("o\u2018", "\u045e"),   # O' → Ў (unicode apostrof)
-        ("G\u2018", "\u0492"), ("g\u2018", "\u0493"),   # G' → Ғ
-        ("O'", "\u040e"), ("o'", "\u045e"),              # O' → Ў (oddiy apostrof)
-        ("G'", "\u0492"), ("g'", "\u0493"),              # G' → Ғ
-        ("Sh", "\u0428"), ("sh", "\u0448"),
-        ("Ch", "\u0427"), ("ch", "\u0447"),
-        ("Ya", "\u042f"), ("ya", "\u044f"),
-        ("Yo", "\u0401"), ("yo", "\u0451"),
-        ("Yu", "\u042e"), ("yu", "\u044e"),
-        ("Ts", "\u0426"), ("ts", "\u0446"),
-    ]
-    for old, new in pairs:
-        text = text.replace(old, new)
+def cancel_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='❌ Bekor qilish')]], resize_keyboard=True, one_time_keyboard=True)
 
-    table = str.maketrans({
-        "A": "\u0410", "a": "\u0430",
-        "B": "\u0411", "b": "\u0431",
-        "D": "\u0414", "d": "\u0434",
-        "E": "\u0415", "e": "\u0435",
-        "F": "\u0424", "f": "\u0444",
-        "G": "\u0413", "g": "\u0433",
-        "H": "\u04b2", "h": "\u04b3",
-        "I": "\u0418", "i": "\u0438",
-        "J": "\u0416", "j": "\u0436",
-        "K": "\u041a", "k": "\u043a",
-        "L": "\u041b", "l": "\u043b",
-        "M": "\u041c", "m": "\u043c",
-        "N": "\u041d", "n": "\u043d",
-        "O": "\u041e", "o": "\u043e",
-        "P": "\u041f", "p": "\u043f",
-        "Q": "\u049a", "q": "\u049b",
-        "R": "\u0420", "r": "\u0440",
-        "S": "\u0421", "s": "\u0441",
-        "T": "\u0422", "t": "\u0442",
-        "U": "\u0423", "u": "\u0443",
-        "V": "\u0412", "v": "\u0432",
-        "X": "\u0425", "x": "\u0445",
-        "Y": "\u0419", "y": "\u0439",
-        "Z": "\u0417", "z": "\u0437",
-        "`": "\u044a", "'": "\u044a", "\u2019": "\u044a",
-    })
-    return text.translate(table)
+async def ask_input(target, text: str):
+    # Ma'lumot kiritish talab qilingan barcha joylarda oddiy reply keyboard bilan bekor qilish tugmasini ko'rsatadi.
+    if isinstance(target, CallbackQuery):
+        try:
+            await target.message.answer(text, reply_markup=cancel_kb())
+        except Exception:
+            log.exception('ask_input failed')
+    else:
+        await target.answer(text, reply_markup=cancel_kb())
 
+async def notify_admins(text: str):
+    # Admin xabarnomalari foydalanuvchi flowini qotirib qo'ymasligi uchun alohida xavfsiz yuboriladi.
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text[:3900])
+        except Exception:
+            log.exception('Admin notification failed: %s', admin_id)
 
-def translit_html_safe(text: str, script: str) -> str:
-    parts = re.split(r"(<[^>]+>)", text)
-    result = []
-    for part in parts:
-        if part.startswith("<") and part.endswith(">"):
-            result.append(part)
-        else:
-            result.append(latin_to_cyrillic_text(part) if script == "cyrillic" else part)
-    return "".join(result)
+# =====================================================
+# DATABASE + MIGRATIONS
+# =====================================================
+def col_exists(table: str, col: str) -> bool:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return any(r[1] == col for r in cur.fetchall())
 
-
-def get_user_script(user_id: int) -> str:
-    ensure_user(user_id)
-    cursor.execute("SELECT script FROM user_prefs WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    return row[0] if row and row[0] in ("latin", "cyrillic") else "latin"
-
-
-def set_user_script(user_id: int, script: str):
-    ensure_user(user_id)
-    if script not in ("latin", "cyrillic"):
-        script = "latin"
-    cursor.execute("UPDATE user_prefs SET script = ? WHERE user_id = ?", (script, user_id))
-    conn.commit()
-
-
-def tr(user_id: int, text: str) -> str:
-    return translit_html_safe(text, get_user_script(user_id))
-
-def like_label(user_id: int) -> str:
-    return "Лайк" if get_user_script(user_id) == "cyrillic" else "Like"
-
-def dislike_label(user_id: int) -> str:
-    return "Дислайк" if get_user_script(user_id) == "cyrillic" else "Dislike"
-
-
-# =========================
-# DB
-# =========================
-def normalize_subject_key(subject_key: str) -> str:
-    if subject_key == "general":
-        return "general"
-    return OLD_TO_NEW_SUBJECT.get(subject_key, subject_key)
-
-def init_db():
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS votes (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT,
-            username TEXT,
-            subject_key TEXT NOT NULL,
-            teacher_key TEXT NOT NULL,
-            voted_at TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_prefs (
-            user_id INTEGER PRIMARY KEY,
-            script TEXT DEFAULT 'latin',
-            access_granted INTEGER DEFAULT 0
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS teacher_ratings (
-            user_id INTEGER NOT NULL,
-            full_name TEXT,
-            username TEXT,
-            subject_key TEXT NOT NULL,
-            teacher_key TEXT NOT NULL,
-            rating TEXT NOT NULL CHECK(rating IN ('like', 'dislike')),
-            rated_at TEXT,
-            PRIMARY KEY (user_id, subject_key, teacher_key)
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS complaints (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            full_name TEXT,
-            username TEXT,
-            message_text TEXT NOT NULL,
-            created_at TEXT
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS db_subjects (
-            subject_key TEXT PRIMARY KEY,
-            subject_name TEXT NOT NULL,
-            sort_order INTEGER DEFAULT 0
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS db_teachers (
-            teacher_key TEXT NOT NULL,
-            subject_key TEXT NOT NULL,
-            teacher_name TEXT NOT NULL,
-            PRIMARY KEY (subject_key, teacher_key),
-            FOREIGN KEY (subject_key) REFERENCES db_subjects(subject_key)
-        )
-    """)
-    conn.commit()
-    migrate_old_subject_keys()
-    _sync_subjects_to_db()
-    if get_setting("voting_open", "") == "":
-        set_setting("voting_open", "1")
-
-def _sync_subjects_to_db():
-    """SUBJECTS dict dan db_subjects/db_teachers ga birinchi marta sync qiladi."""
-    cursor.execute("SELECT COUNT(*) FROM db_subjects")
-    count = cursor.fetchone()[0]
-    if count == 0:
-        for i, (skey, sdata) in enumerate(SUBJECTS.items()):
-            cursor.execute(
-                "INSERT OR IGNORE INTO db_subjects (subject_key, subject_name, sort_order) VALUES (?, ?, ?)",
-                (skey, sdata["name"], i)
-            )
-            for tkey, tname in sdata["teachers"].items():
-                cursor.execute(
-                    "INSERT OR IGNORE INTO db_teachers (teacher_key, subject_key, teacher_name) VALUES (?, ?, ?)",
-                    (tkey, skey, tname)
-                )
-        conn.commit()
-
-def get_subjects_from_db() -> dict:
-    """DB dan bo'limlar va o'qituvchilarni oladi."""
-    cursor.execute("SELECT subject_key, subject_name FROM db_subjects ORDER BY sort_order, subject_key")
-    subjects = {}
-    for skey, sname in cursor.fetchall():
-        subjects[skey] = {"name": sname, "teachers": {}}
-    for skey in subjects:
-        cursor.execute("SELECT teacher_key, teacher_name FROM db_teachers WHERE subject_key = ? ORDER BY teacher_key", (skey,))
-        for tkey, tname in cursor.fetchall():
-            subjects[skey]["teachers"][tkey] = tname
-    return subjects
-
-def migrate_old_subject_keys():
-    for old_key, new_key in OLD_TO_NEW_SUBJECT.items():
-        cursor.execute("UPDATE votes SET subject_key = ? WHERE subject_key = ?", (new_key, old_key))
-        cursor.execute("UPDATE teacher_ratings SET subject_key = ? WHERE subject_key = ?", (new_key, old_key))
-    conn.commit()
+def table_exists(table: str) -> bool:
+    return conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
 
 def get_setting(key: str, default: str = "") -> str:
-    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cursor.fetchone()
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone() if table_exists("settings") else None
     return row[0] if row else default
 
 def set_setting(key: str, value: str):
-    cursor.execute("""
-        INSERT INTO settings (key, value)
-        VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    """, (key, value))
+    conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value)); conn.commit()
+
+def init_db():
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS user_prefs(user_id INTEGER PRIMARY KEY, script TEXT DEFAULT 'latin', access_granted INTEGER DEFAULT 0)")
+    c.execute("""CREATE TABLE IF NOT EXISTS users(
+        telegram_id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, fullname TEXT,
+        username TEXT, phone TEXT, registered_at TEXT, updated_at TEXT, is_blocked INTEGER DEFAULT 0)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS departments(
+        department_key TEXT PRIMARY KEY, name TEXT NOT NULL, sort_order INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1, created_at TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS teachers(
+        teacher_key TEXT NOT NULL, department_key TEXT NOT NULL, name TEXT NOT NULL,
+        student_count INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1, created_at TEXT,
+        PRIMARY KEY(department_key, teacher_key))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS ratings(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, department_key TEXT NOT NULL,
+        teacher_key TEXT NOT NULL, rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+        fullname TEXT, phone TEXT, username TEXT, rated_at TEXT,
+        UNIQUE(user_id, department_key, teacher_key))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS complaints(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, teacher_id TEXT,
+        department_key TEXT, teacher_key TEXT, fullname TEXT, phone TEXT, username TEXT,
+        complaint_text TEXT, message_text TEXT, created_at TEXT, status TEXT DEFAULT 'Yangi')""")
+    c.execute("""CREATE TABLE IF NOT EXISTS suggestions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, fullname TEXT, phone TEXT, username TEXT,
+        suggestion_text TEXT NOT NULL, created_at TEXT, status TEXT DEFAULT 'Yangi')""")
+    # legacy tables preserved
+    c.execute("""CREATE TABLE IF NOT EXISTS votes(
+        user_id INTEGER PRIMARY KEY, full_name TEXT, username TEXT, subject_key TEXT NOT NULL, teacher_key TEXT NOT NULL, voted_at TEXT)""")
     conn.commit()
 
-def ensure_user(user_id: int):
-    cursor.execute("""
-        INSERT INTO user_prefs (user_id, script, access_granted)
-        VALUES (?, 'latin', 0)
-        ON CONFLICT(user_id) DO NOTHING
-    """, (user_id,))
+    for col, ddl in [("student_count", "ALTER TABLE teachers ADD COLUMN student_count INTEGER DEFAULT 0"), ("is_active", "ALTER TABLE teachers ADD COLUMN is_active INTEGER DEFAULT 1")]:
+        if not col_exists("teachers", col): c.execute(ddl)
+    for col, ddl in [("phone", "ALTER TABLE users ADD COLUMN phone TEXT"), ("is_blocked", "ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0")]:
+        if not col_exists("users", col): c.execute(ddl)
+    for col, ddl in [("department_key", "ALTER TABLE complaints ADD COLUMN department_key TEXT"), ("teacher_key", "ALTER TABLE complaints ADD COLUMN teacher_key TEXT"), ("teacher_id", "ALTER TABLE complaints ADD COLUMN teacher_id TEXT"), ("phone", "ALTER TABLE complaints ADD COLUMN phone TEXT"), ("complaint_text", "ALTER TABLE complaints ADD COLUMN complaint_text TEXT"), ("status", "ALTER TABLE complaints ADD COLUMN status TEXT DEFAULT 'Yangi'")]:
+        if not col_exists("complaints", col): c.execute(ddl)
+    for col, ddl in [("fullname", "ALTER TABLE suggestions ADD COLUMN fullname TEXT"), ("phone", "ALTER TABLE suggestions ADD COLUMN phone TEXT"), ("username", "ALTER TABLE suggestions ADD COLUMN username TEXT"), ("suggestion_text", "ALTER TABLE suggestions ADD COLUMN suggestion_text TEXT"), ("created_at", "ALTER TABLE suggestions ADD COLUMN created_at TEXT"), ("status", "ALTER TABLE suggestions ADD COLUMN status TEXT DEFAULT 'Yangi'")]:
+        if not col_exists("suggestions", col): c.execute(ddl)
     conn.commit()
 
-def has_access(user_id: int) -> bool:
-    ensure_user(user_id)
-    cursor.execute("SELECT access_granted FROM user_prefs WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    return bool(row[0]) if row else False
-
-def require_access_only(user_id: int) -> bool:
-    return has_access(user_id)
-
-def grant_access(user_id: int):
-    ensure_user(user_id)
-    cursor.execute("UPDATE user_prefs SET access_granted = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-
-def reset_access(user_id: int):
-    ensure_user(user_id)
-    cursor.execute("UPDATE user_prefs SET access_granted = 0 WHERE user_id = ?", (user_id,))
-    conn.commit()
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-def is_voting_open() -> bool:
-    return get_setting("voting_open", "1") == "1"
-
-def open_voting():
-    set_setting("voting_open", "1")
-
-def close_voting():
-    set_setting("voting_open", "0")
-
-def has_voted(user_id: int) -> bool:
-    cursor.execute("SELECT 1 FROM votes WHERE user_id = ?", (user_id,))
-    return cursor.fetchone() is not None
-
-def save_vote(user_id: int, full_name: str, username: str, subject_key: str, teacher_key: str) -> bool:
-    """
-    Ovoz saqlaydi.
-    True  = ovoz muvaffaqiyatli saqlandi.
-    False = foydalanuvchi oldin ovoz bergan yoki PRIMARY KEY to'qnashuvi bo'lgan.
-    """
-    subject_key = normalize_subject_key(subject_key)
-
-    try:
-        cursor.execute("""
-            INSERT INTO votes (user_id, full_name, username, subject_key, teacher_key, voted_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            user_id,
-            full_name,
-            username,
-            subject_key,
-            teacher_key,
-            uz_now().strftime("%Y-%m-%d %H:%M:%S")
-        ))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-
-# FIX #9: str | None o'rniga Optional[str] — Python 3.9 bilan moslik
-def get_total_votes(subject_key: Optional[str] = None) -> int:
-    if subject_key:
-        cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ?", (normalize_subject_key(subject_key),))
-    else:
-        cursor.execute("SELECT COUNT(*) FROM votes")
-    return cursor.fetchone()[0]
-
-def reset_votes():
-    cursor.execute("DELETE FROM votes")
-    conn.commit()
-
-def reset_ratings():
-    cursor.execute("DELETE FROM teacher_ratings")
-    conn.commit()
-
-def reset_complaints():
-    cursor.execute("DELETE FROM complaints")
-    conn.commit()
-
-def get_subject_name(subject_key: str) -> str:
-    subject_key = normalize_subject_key(subject_key)
-    cursor.execute("SELECT subject_name FROM db_subjects WHERE subject_key = ?", (subject_key,))
-    row = cursor.fetchone()
-    if row:
-        return row[0]
-    return SUBJECTS.get(subject_key, {}).get("name", subject_key)
-
-def get_teacher_name(subject_key: str, teacher_key: str) -> str:
-    subject_key = normalize_subject_key(subject_key)
-    cursor.execute("SELECT teacher_name FROM db_teachers WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-    row = cursor.fetchone()
-    if row:
-        return row[0]
-    return SUBJECTS.get(subject_key, {}).get("teachers", {}).get(teacher_key, teacher_key)
-
-def build_progress_bar(percent: float, length: int = 14) -> str:
-    filled = round((percent / 100) * length)
-    filled = max(0, min(filled, length))
-    return "▓" * filled + "░" * (length - filled)
-
-def get_all_teachers_flat():
-    items = []
-    subjects = get_subjects_from_db()
-    for subject_key, subject_data in subjects.items():
-        for teacher_key, teacher_name in subject_data["teachers"].items():
-            items.append((subject_key, teacher_key, teacher_name))
-    return items
-
-def get_active_subjects() -> dict:
-    return get_subjects_from_db()
-
-# =========================
-# RATING DB / STATS
-# =========================
-def save_teacher_rating(user_id: int, full_name: str, username: str, subject_key: str, teacher_key: str, rating: str):
-    subject_key = normalize_subject_key(subject_key)
-    cursor.execute("""
-        INSERT INTO teacher_ratings (user_id, full_name, username, subject_key, teacher_key, rating, rated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, subject_key, teacher_key)
-        DO UPDATE SET
-            full_name = excluded.full_name,
-            username = excluded.username,
-            rating = excluded.rating,
-            rated_at = excluded.rated_at
-    """, (user_id, full_name, username, subject_key, teacher_key, rating, uz_now().strftime("%Y-%m-%d %H:%M:%S")))
-    conn.commit()
-
-# FIX #9: Optional ishlatildi
-def get_user_teacher_rating(user_id: int, subject_key: str, teacher_key: str) -> Optional[str]:
-    cursor.execute("""
-        SELECT rating FROM teacher_ratings
-        WHERE user_id = ? AND subject_key = ? AND teacher_key = ?
-    """, (user_id, normalize_subject_key(subject_key), teacher_key))
-    row = cursor.fetchone()
-    return row[0] if row else None
-
-def get_rating_counts(subject_key: str, teacher_key: str):
-    cursor.execute("""
-        SELECT
-            SUM(CASE WHEN rating = 'like' THEN 1 ELSE 0 END),
-            SUM(CASE WHEN rating = 'dislike' THEN 1 ELSE 0 END),
-            COUNT(*)
-        FROM teacher_ratings
-        WHERE subject_key = ? AND teacher_key = ?
-    """, (normalize_subject_key(subject_key), teacher_key))
-    like_count, dislike_count, total = cursor.fetchone()
-    like_count = like_count or 0
-    dislike_count = dislike_count or 0
-    total = total or 0
-    like_percent = (like_count / total * 100) if total else 0
-    dislike_percent = (dislike_count / total * 100) if total else 0
-    return like_count, dislike_count, total, like_percent, dislike_percent
-
-def rating_rows():
-    rows = []
-    for subject_key, teacher_key, teacher_name in get_all_teachers_flat():
-        like_count, dislike_count, total, like_percent, dislike_percent = get_rating_counts(subject_key, teacher_key)
-        rows.append({
-            "subject_key": subject_key,
-            "subject_name": get_subject_name(subject_key),
-            "teacher_key": teacher_key,
-            "teacher_name": teacher_name,
-            "like": like_count,
-            "dislike": dislike_count,
-            "total": total,
-            "like_percent": like_percent,
-            "dislike_percent": dislike_percent,
-        })
-    return rows
-
-def get_vote_percent(count: int, denominator: int) -> float:
-    return (count / denominator * 100) if denominator > 0 else 0.0
-
-def save_complaint(user_id: int, full_name: str, username: str, message_text: str):
-    cursor.execute("""
-        INSERT INTO complaints (user_id, full_name, username, message_text, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        user_id,
-        full_name,
-        username,
-        message_text,
-        uz_now().strftime("%Y-%m-%d %H:%M:%S")
-    ))
-    conn.commit()
-
-
-def get_last_complaint_for_user(user_id: int):
-    cursor.execute("""
-        SELECT message_text, created_at
-        FROM complaints
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 1
-    """, (user_id,))
-    return cursor.fetchone()
-
-
-def complaint_allowed(user_id: int, message_text: str):
-    """
-    Shikoyat/taklif spam himoyasi.
-    True, '' qaytarilsa yuborish mumkin. Aks holda False va xabar matni qaytadi.
-    """
-    text = (message_text or "").strip()
-    if len(text) > COMPLAINT_MAX_LENGTH:
-        return False, f"Xabar juda uzun. Iltimos, {COMPLAINT_MAX_LENGTH} ta belgidan oshirmang."
-
-    last = get_last_complaint_for_user(user_id)
-    if not last:
-        return True, ""
-
-    last_text, created_at = last
-    if (last_text or "").strip() == text:
-        return False, "Siz aynan shu xabarni avval yuborgansiz. Iltimos, takroriy xabar yubormang."
-
-    try:
-        last_dt = datetime.strptime(created_at or "", "%Y-%m-%d %H:%M:%S").replace(tzinfo=UZ_TZ)
-        diff = (uz_now() - last_dt).total_seconds()
-        if diff < COMPLAINT_COOLDOWN_SECONDS:
-            wait_seconds = int(COMPLAINT_COOLDOWN_SECONDS - diff)
-            minutes = max(1, (wait_seconds + 59) // 60)
-            return False, f"Spamdan himoya uchun keyingi murojaatni taxminan {minutes} daqiqadan keyin yuboring."
-    except Exception:
-        pass
-
-    return True, ""
-
-# FIX #9: Optional ishlatildi
-def get_complaints_rows(limit: Optional[int] = None):
-    sql = """
-        SELECT id, user_id, full_name, username, message_text, created_at
-        FROM complaints
-        ORDER BY id DESC
-    """
-    params = ()
-    if limit:
-        sql += " LIMIT ?"
-        params = (limit,)
-    cursor.execute(sql, params)
-    return cursor.fetchall()
-
-
-def get_complaints_count() -> int:
-    cursor.execute("SELECT COUNT(*) FROM complaints")
-    return cursor.fetchone()[0]
-
-
-def get_complaints_text(user_id: int) -> str:
-    rows = get_complaints_rows(limit=30)
-    total = get_complaints_count()
-
-    if not rows:
-        return tr(user_id, "📩 <b>Shikoyat va takliflar</b>\n\nHali hech qanday xabar kelmagan.")
-
-    lines = [f"📩 <b>Shikoyat va takliflar</b>\n\nJami: {total} ta\nOxirgi {len(rows)} ta xabar:\n"]
-    for i, (cid, uid, full_name, username, message_text, created_at) in enumerate(rows, start=1):
-        safe_name = escape(full_name or "Noma'lum")
-        safe_username = escape(username or "")
-        safe_message = escape(message_text or "")
-        line = f"{i}. <b>{safe_name}</b>"
-        if safe_username:
-            line += f" (@{safe_username})"
-        line += f"\n   ID: <code>{uid}</code>"
-        line += f"\n   Sana: {escape(created_at or '')}"
-        line += f"\n   Xabar: {safe_message}"
-        lines.append(line)
-
-    text = "\n\n".join(lines)
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n... qisqartirildi"
-    return tr(user_id, text)
-
-
-def export_complaints_to_docx() -> str:
-    if Document is None:
-        path = os.path.join(DATA_DIR, "complaints_export.txt")
-        rows = get_complaints_rows()
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("Shikoyat va takliflar\n")
-            f.write(f"Jami: {len(rows)} ta\n\n")
-            for i, (cid, uid, full_name, username, message_text, created_at) in enumerate(rows, start=1):
-                # FIX #3: f-string ichida apostrof — o'zgaruvchiga olindi
-                name = full_name or "Noma'lum"
-                uname = f"@{username}" if username else ""
-                f.write(f"{i}. {name} ({uname})\n")
-                f.write(f"ID: {uid}\nSana: {created_at or ''}\nXabar: {message_text or ''}\n\n")
-        return path
-
-    rows = get_complaints_rows()
-    doc = Document()
-
-    title = doc.add_heading("Shikoyat va takliflar", 0)
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    p = doc.add_paragraph()
-    p.add_run("Jami xabarlar soni: ").bold = True
-    p.add_run(str(len(rows)))
-
-    p = doc.add_paragraph()
-    p.add_run("Yaratilgan sana: ").bold = True
-    p.add_run(uz_now().strftime("%Y-%m-%d %H:%M:%S"))
-
-    if not rows:
-        doc.add_paragraph("Hali hech qanday shikoyat yoki taklif kelmagan.")
-    else:
-        table = doc.add_table(rows=1, cols=6)
-        table.style = "Table Grid"
-        headers = ["№", "F.I.Sh", "Username", "Telegram ID", "Sana", "Xabar"]
-        for idx, header in enumerate(headers):
-            run = table.rows[0].cells[idx].paragraphs[0].add_run(header)
-            run.bold = True
-
-        for i, (cid, uid, full_name, username, message_text, created_at) in enumerate(rows, start=1):
-            cells = table.add_row().cells
-            cells[0].text = str(i)
-            # FIX #3: apostrof xatosi bartaraf etildi
-            cells[1].text = full_name or "Noma'lum"
-            cells[2].text = f"@{username}" if username else ""
-            cells[3].text = str(uid)
-            cells[4].text = created_at or ""
-            cells[5].text = message_text or ""
-
-    for paragraph in doc.paragraphs:
-        for run in paragraph.runs:
-            run.font.name = "Arial"
-            run.font.size = Pt(11)
-
-    doc.save(COMPLAINTS_DOCX_FILE)
-    return COMPLAINTS_DOCX_FILE
-
-def get_subscription_required_alert(user_id: int) -> str:
-    return tr(user_id, "Avval Telegram kanalga obuna bo'ling va ✅ Tekshirish tugmasini bosing.")
-
-# =========================
-# TEXTS
-# =========================
-def get_welcome_text(user_id: int) -> str:
-    return tr(
-        user_id,
-        "🚀 <b>Botdan foydalanish uchun quyidagilarni bajaring:</b>\n\n"
-        "1️⃣ 📸 Instagram sahifaga o'ting\n"
-        "2️⃣ 📘 Facebook sahifaga o'ting\n"
-        "3️⃣ 📢 Telegram kanalga obuna bo'ling\n\n"
-        "Telegram obunasi bot tomonidan tekshiriladi. Instagram/Facebook tugmalari URL sifatida berilgan.\n\n"
-        "👇 Telegram kanalga obuna bo'lgach, <b>✅ Tekshirish</b> tugmasini bosing."
-    )
-
-def get_home_text(user_id: int) -> str:
-    return tr(user_id, "🏠 <b>Bosh menyu</b>\n\nKerakli bo'limni tanlang:")
-
-def get_help_text(user_id: int) -> str:
-    return tr(
-        user_id,
-        "ℹ️ <b>Yordam</b>\n\n"
-        "• Telegram kanalga obuna bo'ling\n"
-        "• So'ng ✅ Tekshirish tugmasini bosing\n"
-        "• Ovoz berish uchun kafedra tanlanadi\n"
-        "• Keyin o'qituvchi tanlanadi\n"
-        "• Har bir foydalanuvchi asosiy ovozni faqat 1 marta beradi\n"
-        "• O'qituvchilarni baholashda har bir o'qituvchiga 1 ta like/dislike beriladi\n"
-        "• Bahoni keyin o'zgartirish mumkin\n"
-        "• Natijalarni istalgan payt ko'rishingiz mumkin"
-    )
-
-def get_already_voted_text(user_id: int) -> str:
-    return tr(user_id, "✅ <b>Siz allaqachon ovoz berib bo'lgansiz</b>\n\nQayta ovoz berish mumkin emas.")
-
-def get_closed_text(user_id: int) -> str:
-    return tr(user_id, "🔒 <b>Ovoz berish hozircha yopilgan</b>\n\nAdmin tomonidan ovoz berish vaqtincha to'xtatilgan.")
-
-def get_subject_select_text(user_id: int) -> str:
-    return tr(user_id, "🗂 <b>Kafedrani tanlang</b>\n\nQuyidagi bo'limlardan birini tanlang:")
-
-def get_teacher_select_text(user_id: int, subject_key: str) -> str:
-    return tr(user_id, f"{get_subject_name(subject_key)}\n\n<b>O'qituvchini tanlang:</b>")
-
-def get_rating_select_text(user_id: int) -> str:
-    return tr(user_id, "⭐️ <b>O'qituvchilarni baholash</b>\n\nAvval kafedrani tanlang:")
-
-def get_rating_teacher_text(user_id: int, subject_key: str) -> str:
-    return tr(user_id, f"⭐️ <b>{get_subject_name(subject_key)}</b>\n\nBaholash uchun o'qituvchini tanlang:")
-
-def get_rate_text(user_id: int, subject_key: str, teacher_key: str) -> str:
-    current = get_user_teacher_rating(user_id, subject_key, teacher_key)
-    if current == "like":
-        current_text = f"Hozirgi bahoyingiz: 👍 {like_label(user_id)}"
-    elif current == "dislike":
-        current_text = f"Hozirgi bahoyingiz: 👎 {dislike_label(user_id)}"
-    else:
-        current_text = "Hozirgi bahoyingiz: hali baho berilmagan"
-    like_count, dislike_count, total, like_percent, dislike_percent = get_rating_counts(subject_key, teacher_key)
-    return tr(
-        user_id,
-        f"⭐️ <b>O'qituvchini baholash</b>\n\n"
-        f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n"
-        f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, teacher_key)}\n\n"
-        f"{current_text}\n\n"
-        f"👍 {like_label(user_id)}: {like_count} ta ({like_percent:.1f}%)\n"
-        f"👎 {dislike_label(user_id)}: {dislike_count} ta ({dislike_percent:.1f}%)\n"
-        f"Jami: {total} ta\n\n"
-        f"Bahoni tanlang yoki o'zgartiring:"
-    )
-
-def get_complaint_intro_text(user_id: int) -> str:
-    return tr(
-        user_id,
-        "📩 <b>Shikoyat va takliflar</b>\n\n"
-        "Shikoyat, taklif yoki murojaatingizni bitta xabar qilib yozing.\n"
-        "Foydalanuvchi ma'lumotlari sir tutiladi.\n\n"
-        "Bekor qilish uchun <b>❌ Bekor qilish</b> tugmasini bosing."
-    )
-
-
-def get_complaint_saved_text(user_id: int) -> str:
-    return tr(user_id, "✅ <b>Xabaringiz qabul qilindi.</b>\n\nRahmat, murojaatingiz adminlarga yuborildi.")
-
-def get_results_menu_text(user_id: int, is_admin_view: bool = False) -> str:
-    title = "Admin natijalar bo'limi" if is_admin_view else "Natijalar bo'limi"
-    return tr(user_id, f"📊 <b>{title}</b>\n\nKerakli bo'limni tanlang:")
-
-def get_admin_panel_text(user_id: int) -> str:
-    status_text = "🟢 Ochiq" if is_voting_open() else "🔴 Yopiq"
-    return tr(user_id, f"🎛 <b>Admin panel</b>\n\nVoting holati: {status_text}\nJami ovozlar: {get_total_votes()}")
-
-def get_general_results_text(user_id: int) -> str:
-    cursor.execute("""
-        SELECT subject_key, teacher_key, COUNT(*)
-        FROM votes
-        GROUP BY subject_key, teacher_key
-    """)
-    counts = {}
-    for subject_key, teacher_key, count in cursor.fetchall():
-        counts[(normalize_subject_key(subject_key), teacher_key)] = count
-
-    total_votes = sum(counts.values())
-    lines = ["📊 <b>Umumiy natijalar</b>\n"]
-
-    for subject_key, teacher_key, teacher_name in get_all_teachers_flat():
-        count = counts.get((subject_key, teacher_key), 0)
-        percent = get_vote_percent(count, total_votes)
-        lines.append(
-            f"<b>{teacher_name}</b> — {get_subject_name(subject_key)}\n"
-            f"<code>{build_progress_bar(percent)}</code>  <b>{percent:.1f}%</b>  •  {count} ta\n"
-        )
-
-    lines.append(f"🗳 <b>Jami ovozlar:</b> {total_votes}")
-    lines.append(f"{'🟢' if is_voting_open() else '🔴'} <b>Holat:</b> {'Ochiq' if is_voting_open() else 'Yopiq'}")
-
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n... qisqartirildi"
-    return tr(user_id, text)
-
-
-def get_subject_results_text(user_id: int, subject_key: str) -> str:
-    subject_key = normalize_subject_key(subject_key)
-    if subject_key not in get_subjects_from_db():
-        return tr(user_id, "Noto'g'ri kafedra.")
-
-    cursor.execute("""
-        SELECT teacher_key, COUNT(*)
-        FROM votes
-        WHERE subject_key = ?
-        GROUP BY teacher_key
-    """, (subject_key,))
-    subject_counts = {teacher_key: count for teacher_key, count in cursor.fetchall()}
-
-    cursor.execute("SELECT COUNT(*) FROM votes")
-    total_votes = cursor.fetchone()[0]
-    subject_total = sum(subject_counts.values())
-
-    lines = [f"📊 <b>{get_subject_name(subject_key)} bo'yicha natijalar</b>\n"]
-
-    for teacher_key, teacher_name in get_subjects_from_db().get(subject_key, {"teachers": {}}).get("teachers", {}).items():
-        count = subject_counts.get(teacher_key, 0)
-        percent = get_vote_percent(count, subject_total)
-        lines.append(
-            f"<b>{teacher_name}</b>\n"
-            f"<code>{build_progress_bar(percent)}</code>  <b>{percent:.1f}%</b>  •  {count} ta\n"
-        )
-
-    lines.append(f"🗳 <b>Ushbu kafedra ovozlari:</b> {subject_total}")
-    lines.append(f"🗳 <b>Jami ovozlar:</b> {total_votes}")
-    lines.append(f"{'🟢' if is_voting_open() else '🔴'} <b>Holat:</b> {'Ochiq' if is_voting_open() else 'Yopiq'}")
-
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n... qisqartirildi"
-    return tr(user_id, text)
-
-
-# FIX #9: Optional ishlatildi
-def get_rating_stats_text(user_id: int, subject_key: Optional[str] = None) -> str:
-    rows = rating_rows()
-    if subject_key and subject_key != "general":
-        subject_key = normalize_subject_key(subject_key)
-        rows = [r for r in rows if r["subject_key"] == subject_key]
-        title = f"⭐️ <b>{get_subject_name(subject_key)} — baholash foizlari</b>\n"
-    else:
-        title = "⭐️ <b>Umumiy baholash foizlari</b>\n"
-    lines = [title]
-    for r in rows:
-        lines.append(
-            f"<b>{r['teacher_name']}</b> — {r['subject_name']}\n"
-            f"👍 {r['like']} ta ({r['like_percent']:.1f}%) | "
-            f"👎 {r['dislike']} ta ({r['dislike_percent']:.1f}%) | "
-            f"Jami: {r['total']}\n"
-        )
-    text = "\n".join(lines)
-    return tr(user_id, text[:4000] + ("\n\n... qisqartirildi" if len(text) > 4000 else ""))
-
-def get_top_ratings_text(user_id: int) -> str:
-    rows = [r for r in rating_rows() if r["total"] > 0]
-
-    def line_items(items, percent_key: str, icon: str):
-        if not items:
-            return "Ma'lumot yo'q"
-        return "\n".join([
-            f"{i}. {r['teacher_name']} — {r['subject_name']} | {icon} {r[percent_key]:.1f}% | Jami: {r['total']}"
-            for i, r in enumerate(items, 1)
-        ])
-
-    high_like = sorted(rows, key=lambda r: (r["like_percent"], r["total"]), reverse=True)[:10]
-    high_dislike = sorted(rows, key=lambda r: (r["dislike_percent"], r["total"]), reverse=True)[:10]
-
-    text = (
-        "🏆 <b>TOP reytinglar</b>\n\n"
-        "🔝 <b>TOP 10 eng baland like nisbati</b>\n" + line_items(high_like, "like_percent", "👍") + "\n\n"
-        "🔻 <b>TOP 10 eng baland dislike nisbati</b>\n" + line_items(high_dislike, "dislike_percent", "👎")
-    )
-    return tr(user_id, text[:4000] + ("\n\n... qisqartirildi" if len(text) > 4000 else ""))
-
-
-def get_top_votes_text(user_id: int) -> str:
-    """TOP 10 eng ko'p ovoz yiqqan o'qituvchilar ro'yxati."""
-    cursor.execute("""
-        SELECT subject_key, teacher_key, COUNT(*) as vote_count
-        FROM votes
-        GROUP BY subject_key, teacher_key
-        ORDER BY vote_count DESC
-        LIMIT 10
-    """)
-    rows = cursor.fetchall()
-
-    total_votes = get_total_votes()
-
-    if not rows:
-        return tr(user_id, "🥇 <b>TOP 10 — Eng ko'p ovoz yiqqan o'qituvchilar</b>\n\nHali hech kim ovoz bermagan.")
-
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-    lines = [f"🥇 <b>TOP 10 — Eng ko'p ovoz yiqqan o'qituvchilar</b>\n\n🗳 Jami ovozlar: {total_votes}\n"]
-
-    for i, (subject_key, teacher_key, vote_count) in enumerate(rows):
-        subject_key = normalize_subject_key(subject_key)
-        teacher_name = get_teacher_name(subject_key, teacher_key)
-        subject_name = get_subject_name(subject_key)
-        percent = get_vote_percent(vote_count, total_votes)
-        bar = build_progress_bar(percent)
-        medal = medals[i] if i < len(medals) else f"{i+1}."
-        lines.append(
-            f"{medal} <b>{teacher_name}</b>\n"
-            f"   📂 {subject_name}\n"
-            f"   <code>{bar}</code> <b>{percent:.1f}%</b> • {vote_count} ta ovoz\n"
-        )
-
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n... qisqartirildi"
-    return tr(user_id, text)
-
-def get_top_votes_by_subject_text(user_id: int) -> str:
-    """Bo'limlarni umumiy ovoz soni bo'yicha kattadan kichikka saralab ko'rsatadi."""
-    subjects = get_subjects_from_db()
-    total_votes = get_total_votes()
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-
-    # Har bir bo'lim uchun umumiy ovozlar sonini hisoblash
-    subject_totals = []
-    for subject_key, subject_data in subjects.items():
-        cursor.execute(
-            "SELECT COUNT(*) FROM votes WHERE subject_key = ?", (subject_key,)
-        )
-        count = cursor.fetchone()[0]
-        subject_totals.append((subject_key, subject_data["name"], count))
-
-    # Kattadan kichikka saralash
-    subject_totals.sort(key=lambda x: x[2], reverse=True)
-
-    lines = [
-        "🏫 <b>Bo'limlar reytingi — ovoz soni bo'yicha</b>\n",
-        f"🗳 <b>Jami ovozlar:</b> {total_votes}\n",
+    # seed departments/teachers without overwriting admin changes
+    if conn.execute("SELECT COUNT(*) FROM departments").fetchone()[0] == 0:
+        for i, (dkey, data) in enumerate(SUBJECTS.items()):
+            c.execute("INSERT OR IGNORE INTO departments(department_key,name,sort_order,created_at) VALUES(?,?,?,?)", (dkey, data["name"], i, now_str()))
+            for tkey, tname in data["teachers"].items():
+                c.execute("INSERT OR IGNORE INTO teachers(teacher_key,department_key,name,created_at) VALUES(?,?,?,?)", (tkey, dkey, tname, now_str()))
+    # migrate old db_subjects/db_teachers if they exist
+    if table_exists("db_subjects"):
+        for r in conn.execute("SELECT subject_key, subject_name, sort_order FROM db_subjects"):
+            dkey = OLD_TO_NEW_SUBJECT.get(r[0], r[0])
+            c.execute("INSERT OR IGNORE INTO departments(department_key,name,sort_order,created_at) VALUES(?,?,?,?)", (dkey, r[1], r[2] or 0, now_str()))
+    if table_exists("db_teachers"):
+        for r in conn.execute("SELECT teacher_key, subject_key, teacher_name FROM db_teachers"):
+            dkey = OLD_TO_NEW_SUBJECT.get(r[1], r[1])
+            c.execute("INSERT OR IGNORE INTO teachers(teacher_key,department_key,name,created_at) VALUES(?,?,?,?)", (r[0], dkey, r[2], now_str()))
+    # migrate old user names from votes/teacher_ratings
+    for table in ["votes", "teacher_ratings"]:
+        if table_exists(table):
+            cols = [x[1] for x in conn.execute(f"PRAGMA table_info({table})")]
+            if "user_id" in cols:
+                name_col = "full_name" if "full_name" in cols else "fullname" if "fullname" in cols else None
+                uname_col = "username" if "username" in cols else None
+                select = f"SELECT user_id{','+name_col if name_col else ''}{','+uname_col if uname_col else ''} FROM {table}"
+                for row in conn.execute(select):
+                    uid = row[0]; full = row[1] if name_col else ""; uname = row[2] if name_col and uname_col else (row[1] if uname_col and not name_col else "")
+                    c.execute("INSERT OR IGNORE INTO users(telegram_id, fullname, username, registered_at, updated_at) VALUES(?,?,?,?,?)", (uid, full, uname, now_str(), now_str()))
+    # migrate like/dislike table into 1-5 ratings
+    if table_exists("teacher_ratings"):
+        cols = [x[1] for x in conn.execute("PRAGMA table_info(teacher_ratings)")]
+        if "rating" in cols:
+            for r in conn.execute("SELECT * FROM teacher_ratings"):
+                dkey = OLD_TO_NEW_SUBJECT.get(r["subject_key"], r["subject_key"]) if "subject_key" in r.keys() else r["department_key"]
+                val = r["rating"]
+                try: iv = int(val)
+                except Exception: iv = 5 if val == "like" else 1
+                c.execute("""INSERT OR IGNORE INTO ratings(user_id,department_key,teacher_key,rating,fullname,username,rated_at)
+                             VALUES(?,?,?,?,?,?,?)""", (r["user_id"], dkey, r["teacher_key"], iv, r["full_name"] if "full_name" in r.keys() else "", r["username"] if "username" in r.keys() else "", r["rated_at"] if "rated_at" in r.keys() else now_str()))
+    # normalize old subject keys
+    for old, new in OLD_TO_NEW_SUBJECT.items():
+        c.execute("UPDATE votes SET subject_key=? WHERE subject_key=?", (new, old))
+        c.execute("UPDATE ratings SET department_key=? WHERE department_key=?", (new, old))
+    # indexes
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_ratings_teacher ON ratings(department_key,teacher_key)",
+        "CREATE INDEX IF NOT EXISTS idx_ratings_user ON ratings(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_complaints_teacher ON complaints(department_key,teacher_key)",
+        "CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints(status)",
+        "CREATE INDEX IF NOT EXISTS idx_suggestions_status ON suggestions(status)",
+        "CREATE INDEX IF NOT EXISTS idx_suggestions_user ON suggestions(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_teachers_department ON teachers(department_key,is_active)",
     ]
-
-    for rank, (subject_key, sname, count) in enumerate(subject_totals):
-        pct = get_vote_percent(count, total_votes)
-        bar = build_progress_bar(pct)
-        medal = medals[rank] if rank < len(medals) else f"{rank + 1}."
-        lines.append(
-            f"{medal} <b>{sname}</b>\n"
-            f"   <code>{bar}</code> <b>{pct:.1f}%</b> • {count} ta ovoz\n"
-        )
-
-    lines.append(f"{'🟢' if is_voting_open() else '🔴'} <b>Holat:</b> {'Ochiq' if is_voting_open() else 'Yopiq'}")
-
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n... qisqartirildi"
-    return tr(user_id, text)
-
-
-
-def get_users_text(user_id: int) -> str:
-    cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
-    rows = cursor.fetchall()
-    if not rows:
-        return tr(user_id, "👥 Hali hech kim ovoz bermagan.")
-    lines = [f"👥 <b>Kim kimga ovoz berdi</b>\n\nJami: {len(rows)} ta foydalanuvchi\n"]
-    for i, (uid, full_name, username, subject_key, teacher_key, voted_at) in enumerate(rows, start=1):
-        subject_key = normalize_subject_key(subject_key)
-        # FIX #3: f-string ichida apostrof xatosi — o'zgaruvchiga olindi
-        name = full_name or "Noma'lum"
-        line = f"{i}. <b>{name}</b>"
-        if username:
-            line += f" (@{username})"
-        line += f"\n   → Kafedra: {get_subject_name(subject_key)}"
-        line += f"\n   → O'qituvchi: {get_teacher_name(subject_key, teacher_key)}"
-        line += f"\n   → ID: <code>{uid}</code>"
-        if voted_at:
-            line += f"\n   → {voted_at}"
-        lines.append(line)
-    text = "\n\n".join(lines)
-    return tr(user_id, text[:4000] + ("\n\n... qisqartirildi" if len(text) > 4000 else ""))
-
-
-def get_my_vote_text(user_id: int) -> str:
-    cursor.execute("""
-        SELECT subject_key, teacher_key, voted_at
-        FROM votes
-        WHERE user_id = ?
-    """, (user_id,))
-    row = cursor.fetchone()
-    if not row:
-        return tr(user_id, "🧾 <b>Mening ovozim</b>\n\nSiz hali asosiy ovoz bermagansiz.")
-
-    subject_key, teacher_key, voted_at = row
-    subject_key = normalize_subject_key(subject_key)
-    return tr(
-        user_id,
-        f"🧾 <b>Mening ovozim</b>\n\n"
-        f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n"
-        f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, teacher_key)}\n"
-        f"<b>Sana:</b> {voted_at or 'Noma\'lum'}"
-    )
-
-
-def get_my_ratings_text(user_id: int) -> str:
-    cursor.execute("""
-        SELECT subject_key, teacher_key, rating, rated_at
-        FROM teacher_ratings
-        WHERE user_id = ?
-        ORDER BY rated_at DESC
-    """, (user_id,))
-    rows = cursor.fetchall()
-    if not rows:
-        return tr(user_id, "⭐️ <b>Mening baholarim</b>\n\nSiz hali o'qituvchilarga like/dislike bermagansiz.")
-
-    lines = [f"⭐️ <b>Mening baholarim</b>\n\nJami: {len(rows)} ta baho\n"]
-    for i, (subject_key, teacher_key, rating, rated_at) in enumerate(rows, start=1):
-        subject_key = normalize_subject_key(subject_key)
-        icon = "👍" if rating == "like" else "👎"
-        label = like_label(user_id) if rating == "like" else dislike_label(user_id)
-        lines.append(
-            f"{i}. <b>{get_teacher_name(subject_key, teacher_key)}</b>\n"
-            f"   Kafedra: {get_subject_name(subject_key)}\n"
-            f"   Baho: {icon} {label}\n"
-            f"   Sana: {rated_at or ''}"
-        )
-
-    text = "\n\n".join(lines)
-    return tr(user_id, text[:4000] + ("\n\n... qisqartirildi" if len(text) > 4000 else ""))
-
-
-def get_teacher_detailed_stats_text(user_id: int, subject_key: str, teacher_key: str) -> str:
-    subject_key = normalize_subject_key(subject_key)
-    if subject_key not in get_subjects_from_db() or teacher_key not in get_subjects_from_db().get(subject_key, {}).get("teachers", {}):
-        return tr(user_id, "Noto'g'ri o'qituvchi tanlandi.")
-
-    cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-    vote_count = cursor.fetchone()[0]
-    subject_total = get_total_votes(subject_key)
-    total_votes = get_total_votes()
-    vote_percent_subject = get_vote_percent(vote_count, subject_total)
-    vote_percent_total = get_vote_percent(vote_count, total_votes)
-    like_count, dislike_count, rating_total, like_percent, dislike_percent = get_rating_counts(subject_key, teacher_key)
-
-    return tr(
-        user_id,
-        f"👤 <b>O'qituvchi statistikasi</b>\n\n"
-        f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, teacher_key)}\n"
-        f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n\n"
-        f"🗳 <b>Asosiy ovozlar:</b> {vote_count} ta\n"
-        f"📊 <b>Kafedra ichidagi ulushi:</b> {vote_percent_subject:.1f}%\n"
-        f"🌐 <b>Jami ovozlar ichidagi ulushi:</b> {vote_percent_total:.1f}%\n\n"
-        f"👍 <b>{like_label(user_id)}:</b> {like_count} ta ({like_percent:.1f}%)\n"
-        f"👎 <b>{dislike_label(user_id)}:</b> {dislike_count} ta ({dislike_percent:.1f}%)\n"
-        f"⭐️ <b>Jami baholar:</b> {rating_total} ta"
-    )
-
-
-SUBJECTS_RANKING_XLSX_FILE = os.path.join(DATA_DIR, "subjects_ranking_export.xlsx")
-
-def export_subjects_ranking_to_excel() -> str:
-    """Bo'limlarni umumiy ovoz soni bo'yicha saralab Excel faylga eksport qiladi."""
-    total_votes = get_total_votes()
-    subjects = get_subjects_from_db()
-
-    subject_totals = []
-    for subject_key, subject_data in subjects.items():
-        cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ?", (subject_key,))
-        count = cursor.fetchone()[0]
-        pct = round(get_vote_percent(count, total_votes), 2)
-        subject_totals.append((subject_key, subject_data["name"], count, pct))
-    subject_totals.sort(key=lambda x: x[2], reverse=True)
-
-    if Workbook is None:
-        path = os.path.join(DATA_DIR, "subjects_ranking_export.csv")
-        with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(["O'rin", "Bo'lim", "Ovozlar soni", "Foiz (%)"])
-            for rank, (_, sname, count, pct) in enumerate(subject_totals, start=1):
-                writer.writerow([rank, sname, count, pct])
-        return path
-
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    ws = wb.create_sheet("Bo'limlar reytingi")
-    ws_append_header(ws, ["O'rin", "Bo'lim nomi", "Ovozlar soni", "Foiz (%)", "Jami ovozlar"])
-    for rank, (subject_key, sname, count, pct) in enumerate(subject_totals, start=1):
-        ws.append([rank, sname, count, pct, total_votes if rank == 1 else ""])
-
-    # Har bir bo'lim uchun o'qituvchilar bo'yicha alohida varaqlar
-    for subject_key, sname, subj_total, _ in subject_totals:
-        ws_sub = wb.create_sheet((sname[:28] + " top")[:31])
-        ws_append_header(ws_sub, ["O'rin", "O'qituvchi", "Ovozlar", "Bo'lim ichidagi foiz (%)"])
-        cursor.execute("""
-            SELECT teacher_key, COUNT(*) as cnt
-            FROM votes WHERE subject_key = ?
-            GROUP BY teacher_key ORDER BY cnt DESC
-        """, (subject_key,))
-        rows = cursor.fetchall()
-        for rank2, (teacher_key, cnt) in enumerate(rows, start=1):
-            tname = get_teacher_name(subject_key, teacher_key)
-            pct2 = round(get_vote_percent(cnt, subj_total), 2)
-            ws_sub.append([rank2, tname, cnt, pct2])
-
-    wb.save(SUBJECTS_RANKING_XLSX_FILE)
-    return SUBJECTS_RANKING_XLSX_FILE
-
-
-def create_backup_zip() -> str:
+    for q in indexes: c.execute(q)
+    if get_setting("voting_open", "") == "": set_setting("voting_open", "1")
+    if get_setting("daily_backup", "") == "": set_setting("daily_backup", "1")
     conn.commit()
-    votes_path = export_votes_to_excel()
-    rating_path = export_rating_to_excel()
-    users_path = export_users_to_excel()
-    complaints_path = export_complaints_to_docx()
-    subjects_ranking_path = export_subjects_ranking_to_excel()
 
-    with zipfile.ZipFile(BACKUP_ZIP_FILE, "w", zipfile.ZIP_DEFLATED) as zf:
-        if os.path.exists(DB_NAME):
-            zf.write(DB_NAME, arcname="votes.db")
-        for path in (votes_path, rating_path, users_path, complaints_path, subjects_ranking_path):
-            if path and os.path.exists(path):
-                zf.write(path, arcname=os.path.basename(path))
-    return BACKUP_ZIP_FILE
+# =====================================================
+# DATA ACCESS
+# =====================================================
+def ensure_user_obj(m: Message):
+    u = m.from_user
+    full = " ".join([x for x in [u.first_name, u.last_name] if x])
+    conn.execute("""INSERT INTO users(telegram_id,first_name,last_name,fullname,username,registered_at,updated_at)
+        VALUES(?,?,?,?,?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET username=excluded.username, updated_at=excluded.updated_at""",
+        (u.id, u.first_name, u.last_name, full, u.username, now_str(), now_str()))
+    conn.execute("INSERT OR IGNORE INTO user_prefs(user_id) VALUES(?)", (u.id,)); conn.commit()
 
+def user_registered(uid: int) -> bool:
+    r = conn.execute("SELECT first_name,last_name,phone FROM users WHERE telegram_id=?", (uid,)).fetchone()
+    return bool(r and r[0] and r[1] and r[2])
 
-def get_results_text_by_scope(user_id: int, scope: str) -> str:
-    scope = normalize_subject_key(scope)
-    if scope == "general":
-        return get_general_results_text(user_id)
-    if scope in get_subjects_from_db():
-        return get_subject_results_text(user_id, scope)
-    return tr(user_id, "Noto'g'ri bo'lim.")
+def get_user(uid: int): return conn.execute("SELECT * FROM users WHERE telegram_id=?", (uid,)).fetchone()
+def departments(active=True):
+    q = "SELECT * FROM departments" + (" WHERE is_active=1" if active else "") + " ORDER BY sort_order,name"
+    return conn.execute(q).fetchall()
+def teachers(dkey: str, active=True):
+    q = "SELECT * FROM teachers WHERE department_key=?" + (" AND is_active=1" if active else "") + " ORDER BY name"
+    return conn.execute(q, (dkey,)).fetchall()
+def all_teachers(active=True):
+    q = """SELECT t.*, d.name AS department_name FROM teachers t JOIN departments d ON d.department_key=t.department_key"""
+    if active: q += " WHERE t.is_active=1 AND d.is_active=1"
+    q += " ORDER BY d.sort_order,t.name"
+    return conn.execute(q).fetchall()
+def dep_name(dkey):
+    r = conn.execute("SELECT name FROM departments WHERE department_key=?", (dkey,)).fetchone(); return r[0] if r else dkey
+def teacher_name(dkey,tkey):
+    r = conn.execute("SELECT name FROM teachers WHERE department_key=? AND teacher_key=?", (dkey,tkey)).fetchone(); return r[0] if r else tkey
 
-# =========================
-# EXPORT
-# =========================
-def export_votes_to_csv() -> str:
-    cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
-    rows = cursor.fetchall()
-    with open(EXPORT_FILE, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(["User ID", "Full Name", "Username", "Subject", "Teacher", "Voted At"])
-        for user_id, full_name, username, subject_key, teacher_key, voted_at in rows:
-            subject_key = normalize_subject_key(subject_key)
-            writer.writerow([user_id, full_name or "", username or "", get_subject_name(subject_key), get_teacher_name(subject_key, teacher_key), voted_at or ""])
-    return EXPORT_FILE
-
-def ws_append_header(ws, headers):
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.style = "Headline 4"
-
-def export_votes_to_excel() -> str:
-    if Workbook is None:
-        return export_votes_to_csv()
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    ws = wb.create_sheet("Umumiy ovozlar")
-    ws_append_header(ws, ["User ID", "Full Name", "Username", "Kafedra", "O'qituvchi", "Voted At"])
-    cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, voted_at FROM votes ORDER BY voted_at DESC")
-    for user_id, full_name, username, subject_key, teacher_key, voted_at in cursor.fetchall():
-        subject_key = normalize_subject_key(subject_key)
-        ws.append([user_id, full_name or "", username or "", get_subject_name(subject_key), get_teacher_name(subject_key, teacher_key), voted_at or ""])
-
-    for subject_key, subject_data in get_subjects_from_db().items():
-        ws = wb.create_sheet(subject_data["name"][:31])
-        ws_append_header(ws, ["User ID", "Full Name", "Username", "O'qituvchi", "Voted At"])
-        cursor.execute("SELECT user_id, full_name, username, teacher_key, voted_at FROM votes WHERE subject_key = ? ORDER BY voted_at DESC", (subject_key,))
-        for user_id, full_name, username, teacher_key, voted_at in cursor.fetchall():
-            ws.append([user_id, full_name or "", username or "", get_teacher_name(subject_key, teacher_key), voted_at or ""])
-
-    ws = wb.create_sheet("Umumiy natija")
-    ws_append_header(ws, ["O'rin (Reyting)", "Kafedra", "O'qituvchi", "Ovozlar", "Foiz"])
-    total = get_total_votes()
-    all_teachers_data = []
-    for subject_key, teacher_key, teacher_name in get_all_teachers_flat():
-        cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-        count = cursor.fetchone()[0]
-        all_teachers_data.append((get_subject_name(subject_key), teacher_name, count, round((count / total * 100) if total else 0, 2)))
-    all_teachers_data.sort(key=lambda x: x[2], reverse=True)
-    for rank, (subject_name, teacher_name, count, percent) in enumerate(all_teachers_data, start=1):
-        ws.append([rank, subject_name, teacher_name, count, percent])
-
-    for subject_key, subject_data in get_subjects_from_db().items():
-        ws = wb.create_sheet((subject_data["name"][:24] + " natija")[:31])
-        ws_append_header(ws, ["O'rin (Reyting)", "O'qituvchi", "Ovozlar", "Kafedra ichidagi foiz"])
-        subject_total = get_total_votes(subject_key)
-        subject_teachers_data = []
-        for teacher_key, teacher_name in subject_data["teachers"].items():
-            cursor.execute("SELECT COUNT(*) FROM votes WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-            count = cursor.fetchone()[0]
-            subject_teachers_data.append((teacher_name, count, round((count / subject_total * 100) if subject_total else 0, 2)))
-        subject_teachers_data.sort(key=lambda x: x[1], reverse=True)
-        for rank, (teacher_name, count, percent) in enumerate(subject_teachers_data, start=1):
-            ws.append([rank, teacher_name, count, percent])
-
-    wb.save(VOTES_XLSX_FILE)
-    return VOTES_XLSX_FILE
-
-def export_rating_to_excel() -> str:
-    if Workbook is None:
-        path = os.path.join(DATA_DIR, "rating_export.csv")
-        with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Kafedra", "O'qituvchi", "Like", "Dislike", "Jami", "Like %", "Dislike %"])
-            for r in rating_rows():
-                writer.writerow([r["subject_name"], r["teacher_name"], r["like"], r["dislike"], r["total"], round(r["like_percent"], 2), round(r["dislike_percent"], 2)])
-        return path
-
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    ws = wb.create_sheet("Umumiy rating")
-    ws_append_header(ws, ["O'rin (Reyting)", "Kafedra", "O'qituvchi", "Like", "Dislike", "Jami", "Like %", "Dislike %"])
-    sorted_all = sorted(rating_rows(), key=lambda x: x["total"], reverse=True)
-    for rank, r in enumerate(sorted_all, start=1):
-        ws.append([rank, r["subject_name"], r["teacher_name"], r["like"], r["dislike"], r["total"], round(r["like_percent"], 2), round(r["dislike_percent"], 2)])
-
-    for subject_key, subject_data in get_subjects_from_db().items():
-        ws = wb.create_sheet((subject_data["name"][:24] + " rating")[:31])
-        ws_append_header(ws, ["O'rin (Reyting)", "O'qituvchi", "Like", "Dislike", "Jami", "Like %", "Dislike %"])
-        subject_rows = sorted([x for x in rating_rows() if x["subject_key"] == subject_key], key=lambda x: x["total"], reverse=True)
-        for rank, r in enumerate(subject_rows, start=1):
-            ws.append([rank, r["teacher_name"], r["like"], r["dislike"], r["total"], round(r["like_percent"], 2), round(r["dislike_percent"], 2)])
-
-    ws = wb.create_sheet("Umumiy ovozlar")
-    ws_append_header(ws, ["User ID", "Full Name", "Username", "Kafedra", "O'qituvchi", "Rating", "Rated At"])
-    cursor.execute("SELECT user_id, full_name, username, subject_key, teacher_key, rating, rated_at FROM teacher_ratings ORDER BY rated_at DESC")
-    for user_id, full_name, username, subject_key, teacher_key, rating, rated_at in cursor.fetchall():
-        subject_key = normalize_subject_key(subject_key)
-        ws.append([user_id, full_name or "", username or "", get_subject_name(subject_key), get_teacher_name(subject_key, teacher_key), rating, rated_at or ""])
-
-    wb.save(RATING_XLSX_FILE)
-    return RATING_XLSX_FILE
-
-
-
-def export_users_to_excel() -> str:
-    """Barcha foydalanuvchilarni (user_prefs) Excel faylga eksport qiladi."""
-    if Workbook is None:
-        path = os.path.join(DATA_DIR, "users_export.csv")
-        cursor.execute("""
-            SELECT up.user_id, up.script, up.access_granted,
-                   v.full_name, v.username, v.subject_key, v.teacher_key, v.voted_at
-            FROM user_prefs up
-            LEFT JOIN votes v ON up.user_id = v.user_id
-            ORDER BY up.user_id
-        """)
-        rows = cursor.fetchall()
-        with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(["User ID", "Til", "Kirish", "Ism", "Username", "Kafedra", "O'qituvchi", "Ovoz sanasi"])
-            for row in rows:
-                uid, script, access, full_name, username, subject_key, teacher_key, voted_at = row
-                subject_key = normalize_subject_key(subject_key) if subject_key else ""
-                writer.writerow([
-                    uid, script, "Ha" if access else "Yo'q",
-                    full_name or "", username or "",
-                    get_subject_name(subject_key) if subject_key else "",
-                    get_teacher_name(subject_key, teacher_key) if subject_key and teacher_key else "",
-                    voted_at or ""
-                ])
-        return path
-
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    # --- 1-varaq: Barcha foydalanuvchilar ---
-    ws_all = wb.create_sheet("Barcha foydalanuvchilar")
-    ws_append_header(ws_all, [
-        "User ID", "Til", "Kirish", "Ism", "Username",
-        "Kafedra", "O'qituvchi", "Ovoz sanasi"
-    ])
-    cursor.execute("""
-        SELECT up.user_id, up.script, up.access_granted,
-               v.full_name, v.username, v.subject_key, v.teacher_key, v.voted_at
-        FROM user_prefs up
-        LEFT JOIN votes v ON up.user_id = v.user_id
-        ORDER BY up.user_id
-    """)
-    all_rows = cursor.fetchall()
-    for uid, script, access, full_name, username, subject_key, teacher_key, voted_at in all_rows:
-        subject_key = normalize_subject_key(subject_key) if subject_key else ""
-        ws_all.append([
-            uid,
-            script or "latin",
-            "Ha" if access else "Yo'q",
-            full_name or "",
-            username or "",
-            get_subject_name(subject_key) if subject_key else "",
-            get_teacher_name(subject_key, teacher_key) if subject_key and teacher_key else "",
-            voted_at or ""
-        ])
-
-    # --- 2-varaq: Faqat ovoz berganlar ---
-    ws_voted = wb.create_sheet("Ovoz berganlar")
-    ws_append_header(ws_voted, [
-        "User ID", "Ism", "Username", "Kafedra", "O'qituvchi", "Ovoz sanasi"
-    ])
-    cursor.execute("""
-        SELECT user_id, full_name, username, subject_key, teacher_key, voted_at
-        FROM votes ORDER BY voted_at DESC
-    """)
-    for uid, full_name, username, subject_key, teacher_key, voted_at in cursor.fetchall():
-        subject_key = normalize_subject_key(subject_key)
-        ws_voted.append([
-            uid,
-            full_name or "",
-            username or "",
-            get_subject_name(subject_key),
-            get_teacher_name(subject_key, teacher_key),
-            voted_at or ""
-        ])
-
-    # --- 3-varaq: Hali ovoz bermaganlar ---
-    ws_not_voted = wb.create_sheet("Ovoz bermaganlar")
-    ws_append_header(ws_not_voted, ["User ID", "Til", "Kirish"])
-    cursor.execute("""
-        SELECT up.user_id, up.script, up.access_granted
-        FROM user_prefs up
-        LEFT JOIN votes v ON up.user_id = v.user_id
-        WHERE v.user_id IS NULL
-        ORDER BY up.user_id
-    """)
-    for uid, script, access in cursor.fetchall():
-        ws_not_voted.append([uid, script or "latin", "Ha" if access else "Yo'q"])
-
-    wb.save(USERS_XLSX_FILE)
-    return USERS_XLSX_FILE
-
-
-def export_complaints_to_word() -> str:
-    cursor.execute("""
-        SELECT user_id, full_name, username, message_text, created_at
-        FROM complaints
-        ORDER BY created_at DESC
-    """)
-    rows = cursor.fetchall()
-
-    if Document is None:
-        txt_path = os.path.join(DATA_DIR, "shikoyat_takliflar.txt")
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write("Shikoyat va takliflar\n")
-            f.write("=" * 30 + "\n\n")
-            if not rows:
-                f.write("Hali shikoyat yoki taklif yo'q.\n")
-            for i, (user_id, full_name, username, message_text, created_at) in enumerate(rows, 1):
-                # FIX #3: f-string ichida apostrof xatosi tuzatildi
-                name = full_name or "Noma'lum"
-                uname = f"@{username}" if username else "yo'q"
-                f.write(f"{i}. Foydalanuvchi: {name}\n")
-                f.write(f"   Username: {uname}\n")
-                f.write(f"   ID: {user_id}\n")
-                f.write(f"   Sana: {created_at or ''}\n")
-                f.write(f"   Matn: {message_text or ''}\n")
-                f.write("-" * 30 + "\n")
-        return txt_path
-
-    doc = Document()
-    doc.add_heading("Shikoyat va takliflar", level=1)
-
-    if not rows:
-        doc.add_paragraph("Hali shikoyat yoki taklif yo'q.")
-    else:
-        table = doc.add_table(rows=1, cols=6)
-        table.style = "Table Grid"
-        headers = ["№", "F.I.Sh", "Username", "User ID", "Sana", "Matn"]
-        for idx, header in enumerate(headers):
-            table.rows[0].cells[idx].text = header
-
-        for i, (user_id, full_name, username, message_text, created_at) in enumerate(rows, 1):
-            cells = table.add_row().cells
-            cells[0].text = str(i)
-            cells[1].text = full_name or "Noma'lum"
-            cells[2].text = f"@{username}" if username else ""
-            cells[3].text = str(user_id)
-            cells[4].text = created_at or ""
-            cells[5].text = message_text or ""
-
-    doc.save(COMPLAINTS_DOCX_FILE)
-    return COMPLAINTS_DOCX_FILE
-
-# =========================
-# SUBSCRIPTION
-# =========================
-async def check_user_subscription(user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        if member.status in {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER}:
-            return True
-        if member.status == ChatMemberStatus.RESTRICTED:
-            return bool(getattr(member, "is_member", False))
+def save_rating(uid:int, dkey:str, tkey:str, rating:int) -> bool:
+    # Talab bo‘yicha: bir foydalanuvchi bir o‘qituvchini faqat bir marta baholaydi.
+    exists = conn.execute("SELECT id FROM ratings WHERE user_id=? AND department_key=? AND teacher_key=?", (uid, dkey, tkey)).fetchone()
+    if exists:
         return False
-    except Exception as e:
-        logging.error(f"Obunani tekshirishda xatolik: {e}")
-        return False
-
-async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
-    try:
-        await callback.message.edit_text(text=text, parse_mode="HTML", reply_markup=reply_markup)
-    except TelegramBadRequest as e:
-        if "message is not modified" in str(e).lower():
-            return
-        logging.error(f"edit_text xatosi: {e}")
-        try:
-            await callback.message.answer(text=text, parse_mode="HTML", reply_markup=reply_markup)
-        except Exception as e2:
-            logging.error(f"answer fallback xatosi: {e2}")
-    except Exception as e:
-        logging.error(f"safe_edit_message umumiy xato: {e}")
-
-
-
-def add_refresh_time(text: str, user_id: int) -> str:
-    """Telegram edit_text 'message is not modified' xatosini oldini olish uchun vaqt qo'shadi."""
-    return text + tr(user_id, f"  ⏱ Yangilandi: {uz_now().strftime('%H:%M:%S.%f')[:-3]}")
-
-
-def can_start_refresh(user_id: int, key: str) -> bool:
-    """
-    Bitta user bitta bo'limda refreshni ketma-ket bosib yuborsa,
-    parallel callbacklar natijani chalkashtirib yubormasligi uchun cheklaydi.
-    """
-    now = uz_now().timestamp()
-    refresh_key = (user_id, key)
-
-    if refresh_key in REFRESH_BUSY:
-        return False
-
-    last = LAST_REFRESH.get(refresh_key, 0)
-    if now - last < REFRESH_COOLDOWN_SECONDS:
-        return False
-
-    REFRESH_BUSY.add(refresh_key)
-    LAST_REFRESH[refresh_key] = now
+    u=get_user(uid); full=(u["fullname"] if u else "") or " ".join(filter(None,[u["first_name"] if u else "", u["last_name"] if u else ""]))
+    conn.execute("""INSERT INTO ratings(user_id,department_key,teacher_key,rating,fullname,phone,username,rated_at)
+        VALUES(?,?,?,?,?,?,?,?)""",
+        (uid,dkey,tkey,rating,full,u["phone"] if u else "",u["username"] if u else "",now_str()))
+    conn.commit()
     return True
 
+def teacher_stats(dkey:str,tkey:str):
+    t=conn.execute("SELECT * FROM teachers WHERE department_key=? AND teacher_key=?",(dkey,tkey)).fetchone()
+    rows=conn.execute("SELECT rating,COUNT(*) c FROM ratings WHERE department_key=? AND teacher_key=? GROUP BY rating",(dkey,tkey)).fetchall()
+    dist={i:0 for i in range(1,6)}
+    total=0; weighted=0
+    for r in rows:
+        dist[int(r[0])]=r[1]; total+=r[1]; weighted+=int(r[0])*r[1]
+    avg=weighted/total if total else 0
+    sc=(t["student_count"] or 0) if t else 0
+    participation=(total/sc*100) if sc else 0
+    final=avg*(total/sc) if sc else 0
+    return {"avg":avg,"total":total,"student_count":sc,"participation":participation,"final":final,"dist":dist}
 
-def finish_refresh(user_id: int, key: str):
-    REFRESH_BUSY.discard((user_id, key))
+def department_stats(dkey:str):
+    ts=teachers(dkey)
+    total_teachers=len(ts)
+    total_votes=0; weighted_sum=0; student_sum=0; finals=[]
+    for t in ts:
+        st=teacher_stats(dkey,t["teacher_key"])
+        total_votes += st["total"]
+        weighted_sum += st["avg"]*st["total"]
+        student_sum += st["student_count"]
+        finals.append(st["final"])
+    avg=weighted_sum/total_votes if total_votes else 0
+    participation=total_votes/student_sum*100 if student_sum else 0
+    final=sum(finals)/len(finals) if finals else 0
+    return {"teachers":total_teachers,"votes":total_votes,"avg":avg,"participation":participation,"final":final,"student_sum":student_sum}
 
-
-def get_settings_text(user_id: int) -> str:
-    script = get_user_script(user_id)
-    current = "Lotin" if script == "latin" else "Крилл"
-    return tr(
-        user_id,
-        f"⚙️ <b>Sozlamalar</b>\n\n"
-        f"Hozirgi yozuv: <b>{current}</b>\n\n"
-        f"Kerakli yozuv turini tanlang:"
-    )
-
-# =========================
+# =====================================================
 # KEYBOARDS
-# =========================
-def subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="📸 Instagram", url=INSTAGRAM_URL))
-    kb.row(InlineKeyboardButton(text="📘 Facebook", url=FACEBOOK_URL))
-    kb.row(InlineKeyboardButton(text="📢 Telegram", url=CHANNEL_URL))
-    kb.row(InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_subscription"))
-    return kb.as_markup()
+# =====================================================
+def ik(rows: list[list[tuple[str,str]]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t,d in row] for row in rows])
+def main_kb(): return ik([[('📝 Baholash','rate:start')],[('📢 Shikoyat','complaint:start'),('💡 Taklif','suggestion:start')],[('🏆 Reyting','rating:top'),('ℹ️ Ma’lumot','info')]])
+def admin_kb(): return ik([[('📊 Dashboard','admin:dash')],[('👨‍🏫 O‘qituvchilar','admin:teachers'),('⭐ Statistika','admin:tstats')],[('🏛 Kafedralar','admin:dept_rating'),('📢 Shikoyatlar','admin:complaints')],[('💡 Takliflar','admin:suggestions'),('📁 Export / Backup','admin:export')],[('⚙️ Sozlamalar','admin:settings'),('🏠 User menyu','home')]])
+def deps_kb(prefix:str, back='home'):
+    rows=[[ (d['name'][:40], f'{prefix}:{d["department_key"]}') ] for d in departments()]
+    rows.append([('⬅️ Orqaga',back)]); return ik(rows)
+def teachers_kb(dkey:str,prefix:str,back:str):
+    rows=[[ (t['name'][:45], f'{prefix}:{dkey}:{t["teacher_key"]}') ] for t in teachers(dkey)]
+    rows.append([('⬅️ Orqaga',back)]); return ik(rows)
+def rating_stars_kb(dkey,tkey):
+    return ik([[('⭐ 1',f'rate:save:{dkey}:{tkey}:1'),('⭐⭐ 2',f'rate:save:{dkey}:{tkey}:2')],[('⭐⭐⭐ 3',f'rate:save:{dkey}:{tkey}:3')],[('⭐⭐⭐⭐ 4',f'rate:save:{dkey}:{tkey}:4'),('⭐⭐⭐⭐⭐ 5',f'rate:save:{dkey}:{tkey}:5')],[('⬅️ O‘qituvchilar',f'rate:dep:{dkey}')]])
+def phone_kb(): return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='📱 Telefon raqamni yuborish', request_contact=True)], [KeyboardButton(text='❌ Bekor qilish')]], resize_keyboard=True, one_time_keyboard=True)
 
-def home_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    if has_access(user_id):
-        kb.row(
-            InlineKeyboardButton(text=tr(user_id, "🗳 Ovoz berish"), callback_data="go_vote_panel"),
-            InlineKeyboardButton(text=tr(user_id, "⭐️ O'qituvchilarni baholash"), callback_data="go_rating_panel")
-        )
-        kb.row(InlineKeyboardButton(text=tr(user_id, "📊 Natijalar"), callback_data="show_results_menu_user"))
-        kb.row(
-            InlineKeyboardButton(text=tr(user_id, "🧾 Mening ovozim"), callback_data="my_vote"),
-            InlineKeyboardButton(text=tr(user_id, "⭐️ Mening baholarim"), callback_data="my_ratings")
-        )
-        kb.row(InlineKeyboardButton(text=tr(user_id, "📩 Shikoyat va takliflar"), callback_data="go_complaint_panel"))
-    else:
-        kb.row(InlineKeyboardButton(text=tr(user_id, "✅ Obunani tekshirish"), callback_data="check_subscription"))
+def admin_teachers_kb(): return ik([[('➕ Qo‘shish','tm:add'),('📋 Ro‘yxat','tm:list')],[('🔍 Qidirish','tm:search'),('👥 O‘quvchilar soni','tm:students')],[('🏛 Kafedralar','dep:manage')],[('⬅️ Admin','admin:menu')]])
+def admin_settings_kb(): return ik([[('👨‍🏫 O‘qituvchilar','admin:teachers'),('🏛 Kafedralar','set:deps')],[('📢 Shikoyatlar','set:complaints'),('🗳 Baholash','set:voting')],[('📊 Reyting','set:rating'),('🔐 Adminlar','set:admins')],[('📦 Backup','set:backup')],[('⬅️ Admin','admin:menu')]])
 
-    kb.row(
-        InlineKeyboardButton(text=tr(user_id, "ℹ️ Yordam"), callback_data="help_info"),
-        InlineKeyboardButton(text=tr(user_id, "⚙️ Sozlamalar"), callback_data="user_settings")
-    )
-    return kb.as_markup()
+# =====================================================
+# TEXTS
+# =====================================================
+MOTIVATION = """<b>Sizning fikringiz ta’lim sifatini oshirish uchun muhim.</b>\n\nHar bir berilgan baho o‘qituvchilar faoliyatini xolis tahlil qilish, kuchli jihatlarni aniqlash va rivojlantirilishi kerak bo‘lgan yo‘nalishlarni ko‘rish uchun xizmat qiladi.\n\nIltimos, baholashda adolatli, xolis va mas’uliyatli bo‘ling. Sizning javobingiz umumiy reyting va sifat ko‘rsatkichlariga ta’sir qiladi."""
+def home_text(): return "<b>Bosh menyu</b>\nKerakli bo‘limni tanlang."
+def info_text(): return "<b>Ma’lumot</b>\n\nBot o‘qituvchilar faoliyatini 1–5 yulduzli tizimda baholash, reytinglarni ko‘rish va shikoyat va taklif yuborish uchun mo‘ljallangan.\n\nFormula: <code>final_score = average_rating × (total_votes / student_count)</code>"
 
-def settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    current = get_user_script(user_id)
-    latin_text = "✅ Lotin" if current == "latin" else "Lotin"
-    cyrillic_text = "✅ Крилл" if current == "cyrillic" else "Крилл"
-    kb.row(
-        InlineKeyboardButton(text=latin_text, callback_data="set_script:latin"),
-        InlineKeyboardButton(text=cyrillic_text, callback_data="set_script:cyrillic")
-    )
-    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Orqaga"), callback_data="go_home"))
-    return kb.as_markup()
+def teacher_stats_text(dkey,tkey):
+    st=teacher_stats(dkey,tkey); dist='\n'.join([f"{i}⭐: {st['dist'][i]} ta" for i in range(1,6)])
+    return f"<b>O‘qituvchi statistikasi</b>\n\n<b>O‘qituvchi:</b> {safe(teacher_name(dkey,tkey))}\n<b>Kafedra:</b> {safe(dep_name(dkey))}\n\nO‘rtacha baho: <b>{st['avg']:.2f}</b>\nOvozlar soni: <b>{st['total']}</b>\nO‘quvchilar soni: <b>{st['student_count']}</b>\nQatnashuv: <b>{st['participation']:.1f}%</b>\nFinal score: <b>{st['final']:.3f}</b>\n\n<b>Rating distribution</b>\n{dist}"
 
-def subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    for subject_key, subject_data in get_subjects_from_db().items():
-        kb.row(InlineKeyboardButton(text=tr(user_id, subject_data["name"]), callback_data=f"subject:{subject_key}"))
-    kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
-    return kb.as_markup()
+def top_rating_text(limit=20):
+    data=[]
+    for t in all_teachers():
+        st=teacher_stats(t['department_key'],t['teacher_key'])
+        data.append((st['final'],st['avg'],st['total'],t))
+    data.sort(key=lambda x:(x[0],x[2],x[1]), reverse=True)
+    lines=["🏆 <b>O‘qituvchilar reytingi</b>\n"]
+    for i,(final,avg,total,t) in enumerate(data[:limit],1):
+        lines.append(f"{i}. <b>{safe(t['name'])}</b>\n{safe(t['department_name'])}\n⭐ {avg:.2f} • {total} baho • score: <b>{final:.3f}</b>")
+    return '\n\n'.join(lines)
 
-def teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    teachers = list(get_subjects_from_db().get(subject_key, {"teachers": {}}).get("teachers", {}).items())
-    for i in range(0, len(teachers), 2):
-        row = [InlineKeyboardButton(text=tr(user_id, teacher_name), callback_data=f"vote:{subject_key}:{teacher_key}") for teacher_key, teacher_name in teachers[i:i + 2]]
-        kb.row(*row)
-    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Kafedralarga qaytish"), callback_data="go_vote_panel"))
-    kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
-    return kb.as_markup()
+def departments_rating_text():
+    data=[]
+    for d in departments():
+        st=department_stats(d['department_key']); data.append((st['final'],d,st))
+    data.sort(key=lambda x:x[0], reverse=True)
+    lines=["🏛 <b>Kafedralar reytingi</b>\n"]
+    for i,(score,d,st) in enumerate(data,1):
+        lines.append(f"{i}. <b>{safe(d['name'])}</b>\nO‘qituvchi: {st['teachers']} • Baholar: {st['votes']}\nO‘rtacha: {st['avg']:.2f} • Qatnashuv: {st['participation']:.1f}%\nFinal score: <b>{st['final']:.3f}</b>")
+    return '\n\n'.join(lines)
 
-def rating_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    for subject_key, subject_data in get_subjects_from_db().items():
-        kb.row(InlineKeyboardButton(text=tr(user_id, subject_data["name"]), callback_data=f"rating_subject:{subject_key}"))
-    kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
-    return kb.as_markup()
+# =====================================================
+# EXPORT / BACKUP
+# =====================================================
+def style_ws(ws):
+    if Workbook is None: return
+    header_fill=PatternFill("solid", fgColor="1F4E78"); header_font=Font(color="FFFFFF", bold=True)
+    thin=Side(style="thin", color="D9E2F3")
+    for cell in ws[1]: cell.fill=header_fill; cell.font=header_font; cell.alignment=Alignment(horizontal="center"); cell.border=Border(bottom=thin)
+    for col in ws.columns:
+        max_len=max(len(str(c.value or "")) for c in col)
+        ws.column_dimensions[get_column_letter(col[0].column)].width=min(max(max_len+2,12),45)
+    ws.freeze_panes="A2"
 
-def rating_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    teachers = list(get_subjects_from_db().get(subject_key, {"teachers": {}}).get("teachers", {}).items())
-    for i in range(0, len(teachers), 2):
-        row = [InlineKeyboardButton(text=tr(user_id, teacher_name), callback_data=f"rating_teacher:{subject_key}:{teacher_key}") for teacher_key, teacher_name in teachers[i:i + 2]]
-        kb.row(*row)
-    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Kafedralarga qaytish"), callback_data="go_rating_panel"))
-    kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
-    return kb.as_markup()
+def export_all_excel() -> Path:
+    if Workbook is None:
+        path=DATA_DIR/"export.csv"; return path
+    wb=Workbook(); wb.remove(wb.active)
+    sheets = {
+        "Users": ("SELECT telegram_id,first_name,last_name,fullname,username,phone,registered_at FROM users", ["Telegram ID","Ism","Familiya","FISH","Username","Telefon","Ro‘yxat"]),
+        "Departments": ("SELECT department_key,name,sort_order,is_active FROM departments", ["Key","Nomi","Tartib","Active"]),
+        "Teachers": ("SELECT department_key,teacher_key,name,student_count,is_active FROM teachers", ["Kafedra","Teacher key","O‘qituvchi","O‘quvchilar soni","Active"]),
+        "Ratings": ("SELECT user_id,department_key,teacher_key,rating,fullname,phone,username,rated_at FROM ratings ORDER BY rated_at DESC", ["User ID","Kafedra","Teacher key","Baho","FISH","Telefon","Username","Sana"]),
+        "Complaints": ("SELECT id,user_id,department_key,teacher_key,fullname,phone,complaint_text,status,created_at FROM complaints ORDER BY id DESC", ["ID","User ID","Kafedra","Teacher key","FISH","Telefon","Shikoyat","Status","Sana"]),
+        "Suggestions": ("SELECT id,user_id,fullname,phone,username,suggestion_text,status,created_at FROM suggestions ORDER BY id DESC", ["ID","User ID","FISH","Telefon","Username","Taklif","Status","Sana"]),
+    }
+    for name,(query,headers) in sheets.items():
+        ws=wb.create_sheet(name); ws.append(headers)
+        for r in conn.execute(query): ws.append(list(r))
+        style_ws(ws)
+    ws=wb.create_sheet("Teacher Stats"); ws.append(["Kafedra","O‘qituvchi","Average","Votes","Students","Participation %","Final score","1⭐","2⭐","3⭐","4⭐","5⭐"])
+    for t in all_teachers(active=False):
+        st=teacher_stats(t['department_key'],t['teacher_key'])
+        ws.append([dep_name(t['department_key']),t['name'],round(st['avg'],2),st['total'],st['student_count'],round(st['participation'],2),round(st['final'],4),st['dist'][1],st['dist'][2],st['dist'][3],st['dist'][4],st['dist'][5]])
+    style_ws(ws)
+    path=DATA_DIR/f"full_export_{datetime.now(UZ_TZ).strftime('%Y%m%d_%H%M%S')}.xlsx"; wb.save(path); return path
 
-def rate_keyboard(user_id: int, subject_key: str, teacher_key: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text=f"👍 {like_label(user_id)}", callback_data=f"rate:like:{subject_key}:{teacher_key}"),
-        InlineKeyboardButton(text=f"👎 {dislike_label(user_id)}", callback_data=f"rate:dislike:{subject_key}:{teacher_key}")
-    )
-    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ O'qituvchilar"), callback_data=f"rating_subject:{subject_key}"))
-    kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
-    return kb.as_markup()
+def make_backup() -> Path:
+    import zipfile
+    export_path=export_all_excel()
+    backup=BACKUP_DIR/f"backup_{datetime.now(UZ_TZ).strftime('%Y%m%d_%H%M%S')}.zip"
+    conn.commit()
+    with zipfile.ZipFile(backup,"w",zipfile.ZIP_DEFLATED) as z:
+        if DB_PATH.exists(): z.write(DB_PATH, "votes.db")
+        if export_path.exists(): z.write(export_path, export_path.name)
+    return backup
 
-def results_menu_keyboard_user(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    for subject_key, subject_data in get_subjects_from_db().items():
-        kb.row(InlineKeyboardButton(text=tr(user_id, subject_data["name"]), callback_data=f"show_results_user:{subject_key}"))
-    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Orqaga"), callback_data="go_home"))
-    return kb.as_markup()
-
-def results_menu_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    for subject_key, subject_data in get_subjects_from_db().items():
-        kb.row(InlineKeyboardButton(text=subject_data["name"], callback_data=f"show_results_admin:{subject_key}"))
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    return kb.as_markup()
-
-def rating_results_menu_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    for subject_key, subject_data in get_subjects_from_db().items():
-        kb.row(InlineKeyboardButton(text=subject_data["name"], callback_data=f"show_rating_stats:{subject_key}"))
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    return kb.as_markup()
-
-def results_keyboard_user(user_id: int, scope: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data=f"refresh_results_user:{scope}"),
-        InlineKeyboardButton(text=tr(user_id, "📂 Bo'limlar"), callback_data="show_results_menu_user")
-    )
-    kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
-    return kb.as_markup()
-
-def results_keyboard_admin(user_id: int, scope: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data=f"refresh_results_admin:{scope}"),
-        InlineKeyboardButton(text=tr(user_id, "📂 Bo'limlar"), callback_data="admin_results")
-    )
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    return kb.as_markup()
-
-def rating_stats_keyboard_admin(user_id: int, scope: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data=f"refresh_rating_stats:{scope}"),
-        InlineKeyboardButton(text=tr(user_id, "📂 Bo'limlar"), callback_data="admin_rating_stats")
-    )
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    return kb.as_markup()
-
-def after_vote_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text=tr(user_id, "📊 Natijalar"), callback_data="show_results_menu_user"),
-        InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home")
-    )
-    return kb.as_markup()
-
-
-def confirm_vote_keyboard(user_id: int, subject_key: str, teacher_key: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text=tr(user_id, "✅ Tasdiqlash"), callback_data=f"confirm_vote:{subject_key}:{teacher_key}"),
-        InlineKeyboardButton(text=tr(user_id, "❌ Bekor qilish"), callback_data=f"subject:{subject_key}")
-    )
-    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ O'qituvchilar"), callback_data=f"subject:{subject_key}"))
-    kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
-    return kb.as_markup()
-
-
-def simple_back_home_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
-    return kb.as_markup()
-
-
-def teacher_stats_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    for subject_key, subject_data in get_subjects_from_db().items():
-        kb.row(InlineKeyboardButton(text=tr(user_id, subject_data["name"]), callback_data=f"teacher_stats_subject:{subject_key}"))
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    return kb.as_markup()
-
-
-def teacher_stats_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    teachers = list(get_subjects_from_db().get(subject_key, {"teachers": {}}).get("teachers", {}).items())
-    for i in range(0, len(teachers), 2):
-        row = [InlineKeyboardButton(text=tr(user_id, teacher_name), callback_data=f"teacher_stats:{subject_key}:{teacher_key}") for teacher_key, teacher_name in teachers[i:i + 2]]
-        kb.row(*row)
-    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Kafedralarga qaytish"), callback_data="admin_teacher_stats"))
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    return kb.as_markup()
-
-
-def teacher_stats_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ O'qituvchilar"), callback_data=f"teacher_stats_subject:{subject_key}"))
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    return kb.as_markup()
-
-def admin_panel_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="📊 Ovoz natijalari", callback_data="admin_results"))
-    kb.row(InlineKeyboardButton(text="⭐️ Baholash foizlari", callback_data="admin_rating_stats"))
-    kb.row(InlineKeyboardButton(text="🏆 TOP reytinglar", callback_data="admin_top_ratings"))
-    kb.row(InlineKeyboardButton(text="🥇 TOP 10 ovoz bo'yicha", callback_data="admin_top_votes_menu"))
-    kb.row(InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin_users"))
-    kb.row(InlineKeyboardButton(text="👤 O'qituvchi statistikasi", callback_data="admin_teacher_stats"))
-    kb.row(InlineKeyboardButton(text="📩 Shikoyat/takliflar", callback_data="admin_complaints"))
-    kb.row(
-        InlineKeyboardButton(text="📁 Excel ovozlar", callback_data="admin_export_votes_excel"),
-        InlineKeyboardButton(text="📁 Excel rating", callback_data="admin_export_rating_excel")
-    )
-    kb.row(
-        InlineKeyboardButton(text="🔓 Open", callback_data="admin_open"),
-        InlineKeyboardButton(text="🔒 Close", callback_data="admin_close")
-    )
-    kb.row(
-        InlineKeyboardButton(text="♻️ Reset ovozlar", callback_data="admin_reset_votes_confirm"),
-        InlineKeyboardButton(text="🗑 Reset rating", callback_data="admin_reset_rating_confirm")
-    )
-    kb.row(InlineKeyboardButton(text="🧹 Shikoyatlarni tozalash", callback_data="admin_reset_complaints_confirm"))
-    kb.row(InlineKeyboardButton(text="💾 Backup", callback_data="admin_backup"))
-    kb.row(InlineKeyboardButton(text="⚙️ Bo'lim va o'qituvchilarni boshqarish", callback_data="admin_manage_menu"))
-    return kb.as_markup()
-
-def reset_confirm_keyboard(user_id: int, mode: str = "votes") -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    if mode == "votes":
-        yes_cb = "admin_reset_votes"
-    elif mode == "rating":
-        yes_cb = "admin_reset_rating"
-    elif mode == "complaints":
-        yes_cb = "admin_reset_complaints"
-    else:
-        yes_cb = "admin_reset_votes"
-    kb.row(
-        InlineKeyboardButton(text=tr(user_id, "❌ Bekor qilish"), callback_data="cancel_reset"),
-        InlineKeyboardButton(text="✅ Ha, o'chirish", callback_data=yes_cb)
-    )
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    return kb.as_markup()
-
-def complaint_cancel_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text=tr(user_id, "❌ Bekor qilish"), callback_data="cancel_complaint"))
-    kb.row(InlineKeyboardButton(text=tr(user_id, "🏠 Bosh menyu"), callback_data="go_home"))
-    return kb.as_markup()
-
-def complaints_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="refresh_admin_complaints"),
-        InlineKeyboardButton(text="📄 Word", callback_data="admin_export_complaints_docx")
-    )
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    return kb.as_markup()
-
-def users_keyboard_admin(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="refresh_admin_users"),
-        InlineKeyboardButton(text="📊 Excel", callback_data="admin_export_users_excel")
-    )
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    return kb.as_markup()
-
-# =========================
-# START / COMMANDS
-# =========================
-@dp.message(Command("start"))
-async def start_handler(message: Message):
-    user_id = message.from_user.id
-    ensure_user(user_id)
-
-    if has_access(user_id):
-        await message.answer(get_home_text(user_id), parse_mode="HTML", reply_markup=home_keyboard(user_id))
-        return
-
-    if not await check_user_subscription(user_id):
-        await message.answer(get_welcome_text(user_id), parse_mode="HTML", reply_markup=subscription_keyboard(user_id))
-        return
-
-    grant_access(user_id)
-    await message.answer(get_home_text(user_id), parse_mode="HTML", reply_markup=home_keyboard(user_id))
-
-
-@dp.message(Command("my_access"))
-async def my_access_handler(message: Message):
-    user_id = message.from_user.id
-    ensure_user(user_id)
-    if not is_admin(user_id):
-        return
-    cursor.execute("SELECT access_granted FROM user_prefs WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    # FIX #3: apostrof xatosi tuzatildi
-    val = row[0] if row else "yo'q"
-    await message.answer(f"access_granted: {val}")
-
-@dp.message(Command("check_channel"))
-async def check_channel_handler(message: Message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        await message.answer("Siz admin emassiz.")
-        return
+# =====================================================
+# ACCESS / SUBSCRIPTION
+# =====================================================
+async def check_sub(uid:int) -> bool:
+    if not setting_bool("subscription_required", "1"): return True
     try:
-        me = await bot.get_me()
-        member = await bot.get_chat_member(CHANNEL_USERNAME, me.id)
-        if member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}:
-            await message.answer(f"✅ Bot kanalni ko'ra olyapti va admin.\nKanal: {CHANNEL_USERNAME}")
-        else:
-            await message.answer("⚠️ Bot kanalni ko'ryapti, lekin admin emas. Obuna tekshiruvi to'liq ishlashi uchun botni kanalga admin qiling.")
-    except Exception as e:
-        await message.answer(f"❌ Kanalni tekshirib bo'lmadi.\nBotni kanalga admin qiling.\nXato: {e}")
+        m=await bot.get_chat_member(CHANNEL_USERNAME, uid)
+        return m.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
+    except Exception:
+        return False
 
-@dp.message(Command("results"))
-async def results_handler(message: Message):
-    user_id = message.from_user.id
-    ensure_user(user_id)
-    await message.answer(get_results_menu_text(user_id, False), parse_mode="HTML", reply_markup=results_menu_keyboard_user(user_id))
+def sub_kb(): return ik([[('📢 Telegram kanal', 'url:noop')],[('✅ Tekshirish','check_sub')]])
 
-@dp.message(Command("debug_eshnazarova"))
-async def debug_eshnazarova_handler(message: Message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
+# =====================================================
+# USER HANDLERS
+# =====================================================
+@dp.message(Command("start"))
+async def start(m: Message, state:FSMContext):
+    await state.clear(); ensure_user_obj(m)
+    if not await check_sub(m.from_user.id):
+        kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📢 Telegram kanal', url=CHANNEL_URL)],[InlineKeyboardButton(text='✅ Tekshirish', callback_data='check_sub')]])
+        return await m.answer("Botdan foydalanish uchun Telegram kanalga obuna bo‘ling.", reply_markup=kb)
+    await m.answer(home_text(), reply_markup=main_kb())
 
-    cursor.execute("""
-        SELECT user_id, full_name, username, subject_key, teacher_key, voted_at
-        FROM votes
-        WHERE teacher_key = 'aif_10'
-        ORDER BY voted_at DESC
-    """)
-    rows = cursor.fetchall()
-    if not rows:
-        await message.answer("Eshnazarova Maziya Allanazarovna uchun bazada ovoz yo'q.")
-        return
-
-    lines = ["Eshnazarova Maziya Allanazarovna uchun bazadagi ovozlar:"]
-    for uid, full_name, username, subject_key, teacher_key, voted_at in rows:
-        lines.append(f"ID: {uid} | {full_name or ''} | @{username or ''} | {subject_key}/{teacher_key} | {voted_at}")
-    await message.answer("\n".join(lines[:50]))
+@dp.callback_query(F.data == 'check_sub')
+async def cb_check(call: CallbackQuery):
+    await answer_cb(call)
+    if await check_sub(call.from_user.id): await edit_or_send(call, home_text(), main_kb())
+    else: await call.answer("Avval kanalga obuna bo‘ling.", show_alert=True)
 
 @dp.message(Command("admin"))
-async def admin_panel_handler(message: Message):
-    user_id = message.from_user.id
-    ensure_user(user_id)
-    if not is_admin(user_id):
-        await message.answer("Siz admin emassiz.")
-        return
-    await message.answer(get_admin_panel_text(user_id), parse_mode="HTML", reply_markup=admin_panel_keyboard(user_id))
+async def admin_cmd(m:Message):
+    ensure_user_obj(m)
+    if not is_admin(m.from_user.id): return await m.answer("Ruxsat yo‘q.")
+    await m.answer("<b>Admin panel</b>", reply_markup=admin_kb())
 
-@dp.message(Command("users"))
-async def admin_users_handler(message: Message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        await message.answer("Siz admin emassiz.")
-        return
-    await message.answer(get_users_text(user_id), parse_mode="HTML", reply_markup=users_keyboard_admin(user_id))
+@dp.callback_query(F.data == 'home')
+async def home_cb(call:CallbackQuery): await answer_cb(call); await edit_or_send(call, home_text(), main_kb())
+@dp.callback_query(F.data == 'info')
+async def info_cb(call:CallbackQuery): await answer_cb(call); await edit_or_send(call, info_text(), ik([[('⬅️ Orqaga','home')]]))
 
-@dp.message(Command("export"))
-async def admin_export_handler(message: Message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        await message.answer("Siz admin emassiz.")
-        return
-    filename = export_votes_to_excel()
-    await message.answer_document(FSInputFile(filename), caption="📁 Ovozlar Excel fayl ko'rinishida.")
-
-@dp.message(Command("open"))
-async def admin_open_handler(message: Message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        await message.answer("Siz admin emassiz.")
-        return
-    open_voting()
-    await message.answer("🟢 Ovoz berish ochildi.")
-
-@dp.message(Command("close"))
-async def admin_close_handler(message: Message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        await message.answer("Siz admin emassiz.")
-        return
-    close_voting()
-    await message.answer("🔴 Ovoz berish yopildi.")
-
-@dp.message(Command("reset_votes"))
-async def admin_reset_handler(message: Message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        await message.answer("Siz admin emassiz.")
-        return
-    await message.answer(
-        "⚠️ <b>Diqqat!</b>\n\nBarcha ovozlar o'chiriladi.\nDavom etasizmi?",
-        parse_mode="HTML",
-        reply_markup=reset_confirm_keyboard(user_id, "votes")
-    )
-
-# =========================
-# USER CALLBACKS
-# =========================
-@dp.callback_query(F.data == "go_home")
-async def go_home_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    ensure_user(user_id)
-    if require_access_only(user_id):
-        await safe_edit_message(callback, get_home_text(user_id), home_keyboard(user_id))
+@dp.message(StateFilter('*'), F.text == '❌ Bekor qilish')
+async def cancel_button(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer('Jarayon bekor qilindi.', reply_markup=ReplyKeyboardRemove())
+    if is_admin(m.from_user.id):
+        await m.answer('<b>Admin panel</b>', reply_markup=admin_kb())
     else:
-        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
-    await callback.answer()
+        await m.answer(home_text(), reply_markup=main_kb())
 
+async def start_registration(target, state:FSMContext, after:str):
+    await state.set_state(Register.first_name); await state.update_data(after=after)
+    await ask_input(target, "Baholashdan oldin ro‘yxatdan o‘ting.\n\nIsmingizni kiriting:")
 
-@dp.callback_query(F.data == "help_info")
-async def help_info_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text=tr(user_id, "⬅️ Orqaga"), callback_data="go_home"))
-    await safe_edit_message(callback, get_help_text(user_id), kb.as_markup())
-    await callback.answer()
+@dp.message(Register.first_name)
+async def reg_first(m:Message,state:FSMContext):
+    first=(m.text or "").strip()
+    if len(first) < 2: return await m.answer("Ism juda qisqa. Qaytadan kiriting:", reply_markup=cancel_kb())
+    await state.update_data(first_name=first); await state.set_state(Register.last_name); await ask_input(m, "Familiyangizni kiriting:")
+@dp.message(Register.last_name)
+async def reg_last(m:Message,state:FSMContext):
+    last=(m.text or "").strip()
+    if len(last) < 2: return await m.answer("Familiya juda qisqa. Qaytadan kiriting:", reply_markup=cancel_kb())
+    await state.update_data(last_name=last); await state.set_state(Register.phone); await m.answer("Telefon raqamingizni contact button orqali yuboring:", reply_markup=phone_kb())
+@dp.message(Register.phone)
+async def reg_phone(m:Message,state:FSMContext):
+    if not m.contact or m.contact.user_id != m.from_user.id: return await m.answer("Iltimos, pastdagi contact tugmasi orqali o‘z telefon raqamingizni yuboring.", reply_markup=phone_kb())
+    data=await state.get_data(); full=f"{data['first_name']} {data['last_name']}"
+    conn.execute("""INSERT INTO users(telegram_id,first_name,last_name,fullname,username,phone,registered_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(telegram_id) DO UPDATE SET first_name=excluded.first_name,last_name=excluded.last_name,fullname=excluded.fullname,username=excluded.username,phone=excluded.phone,updated_at=excluded.updated_at""",
+        (m.from_user.id,data['first_name'],data['last_name'],full,m.from_user.username,m.contact.phone_number,now_str(),now_str()))
+    conn.commit(); after=data.get('after','rate') ; await state.clear()
+    await m.answer("Ro‘yxatdan o‘tish yakunlandi.", reply_markup=ReplyKeyboardRemove())
+    if after=='complaint': await m.answer("Kafedrani tanlang:", reply_markup=deps_kb('complaint:dep','home'))
+    elif after=='suggestion':
+        await state.set_state(SuggestionFSM.text)
+        await ask_input(m, "💡 Taklifingizni yozing. Matn aniq va lo‘nda bo‘lsa, ko‘rib chiqish oson bo‘ladi:")
+    else: await m.answer(MOTIVATION, reply_markup=deps_kb('rate:dep','home'))
 
-@dp.callback_query(F.data == "my_vote")
-async def my_vote_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not require_access_only(user_id):
-        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
-        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
-        return
-    await safe_edit_message(callback, get_my_vote_text(user_id), simple_back_home_keyboard(user_id))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "my_ratings")
-async def my_ratings_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not require_access_only(user_id):
-        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
-        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
-        return
-    await safe_edit_message(callback, get_my_ratings_text(user_id), simple_back_home_keyboard(user_id))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "go_complaint_panel")
-async def go_complaint_panel_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    ensure_user(user_id)
-
-    if not has_access(user_id):
-        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
-        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
-        return
-
-    WAITING_COMPLAINT_TEXT.add(user_id)
-    await safe_edit_message(callback, get_complaint_intro_text(user_id), complaint_cancel_keyboard(user_id))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "cancel_complaint")
-async def cancel_complaint_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    WAITING_COMPLAINT_TEXT.discard(user_id)
-
-    if has_access(user_id):
-        await safe_edit_message(callback, get_home_text(user_id), home_keyboard(user_id))
-    else:
-        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
-    await callback.answer(tr(user_id, "Bekor qilindi"))
-
-
-@dp.callback_query(F.data == "user_settings")
-async def user_settings_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    ensure_user(user_id)
-    await safe_edit_message(callback, get_settings_text(user_id), settings_keyboard(user_id))
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("set_script:"))
-async def set_script_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    ensure_user(user_id)
-
-    script = callback.data.split(":", 1)[1]
-    if script not in ("latin", "cyrillic"):
-        await callback.answer("Xato", show_alert=True)
-        return
-
-    set_user_script(user_id, script)
-    await safe_edit_message(callback, get_settings_text(user_id), settings_keyboard(user_id))
-    await callback.answer(tr(user_id, "Yozuv turi saqlandi"))
-
-@dp.callback_query(F.data == "check_subscription")
-async def check_subscription_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    ensure_user(user_id)
-
-    ok = await check_user_subscription(user_id)
+@dp.callback_query(F.data == 'rate:start')
+async def rate_start(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call)
+    await state.clear()
+    if not await check_sub(call.from_user.id):
+        return await call.answer('Avval kanalga obuna bo‘ling.', show_alert=True)
+    if not setting_bool('voting_open','1'): return await call.answer('Baholash hozircha yopilgan.', show_alert=True)
+    if not user_registered(call.from_user.id): return await start_registration(call,state,'rate')
+    await edit_or_send(call, MOTIVATION, deps_kb('rate:dep','home'))
+@dp.callback_query(F.data.startswith('rate:dep:'))
+async def rate_dep(call:CallbackQuery):
+    await answer_cb(call); dkey=call.data.split(':',2)[2]
+    await edit_or_send(call, f"<b>{safe(dep_name(dkey))}</b>\nO‘qituvchini tanlang:", teachers_kb(dkey,'rate:teacher','rate:start'))
+@dp.callback_query(F.data.startswith('rate:teacher:'))
+async def rate_teacher(call:CallbackQuery):
+    await answer_cb(call); _,_,dkey,tkey=call.data.split(':',3)
+    old=conn.execute("SELECT rating FROM ratings WHERE user_id=? AND department_key=? AND teacher_key=?",(call.from_user.id,dkey,tkey)).fetchone()
+    if old:
+        return await edit_or_send(call, f"<b>{safe(teacher_name(dkey,tkey))}</b>\n\nSiz bu o‘qituvchini avval baholagansiz: <b>{old[0]}⭐</b>", ik([[('⬅️ O‘qituvchilar',f'rate:dep:{dkey}')],[('🏠 Menyu','home')]]))
+    txt=f"<b>{safe(teacher_name(dkey,tkey))}</b>\n\nBahoni tanlang."
+    await edit_or_send(call, txt, rating_stars_kb(dkey,tkey))
+@dp.callback_query(F.data.startswith('rate:save:'))
+async def rate_save(call:CallbackQuery):
+    await answer_cb(call); _,_,dkey,tkey,val=call.data.split(':',4)
+    if not user_registered(call.from_user.id): return await call.answer('Avval ro‘yxatdan o‘ting.', show_alert=True)
+    ok = save_rating(call.from_user.id,dkey,tkey,int(val))
     if not ok:
-        reset_access(user_id)
-        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
-        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
-        return
+        return await call.answer('Siz bu o‘qituvchini avval baholagansiz.', show_alert=True)
+    await edit_or_send(call, f"✅ Baho saqlandi: <b>{val}⭐</b>\n\n{safe(teacher_name(dkey,tkey))}", ik([[('Yana baholash','rate:start'),('🏆 Reyting','rating:top')],[('🏠 Menyu','home')]]))
 
-    grant_access(user_id)
+@dp.callback_query(F.data == 'rating:top')
+async def rating_top(call:CallbackQuery): await answer_cb(call); await edit_or_send(call, top_rating_text(), ik([[('🏛 Kafedralar','dept_rating:public')],[('⬅️ Orqaga','home')]]))
+@dp.callback_query(F.data == 'dept_rating:public')
+async def public_deps(call:CallbackQuery): await answer_cb(call); await edit_or_send(call, departments_rating_text(), ik([[('⬅️ Reyting','rating:top')]]))
 
-    # FIX #5: grant_access dan keyin keraksiz tekshiruv olib tashlandi
-    await safe_edit_message(
-        callback,
-        "✅ <b>Obuna tasdiqlandi</b>\n\nEndi bosh menyudan bemalol foydalanishingiz mumkin:",
-        home_keyboard(user_id)
+@dp.callback_query(F.data == 'complaint:start')
+async def complaint_start(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call)
+    await state.clear()
+    if not user_registered(call.from_user.id): return await start_registration(call,state,'complaint')
+    await state.set_state(ComplaintFSM.department); await edit_or_send(call,"Kafedrani tanlang:", deps_kb('complaint:dep','home'))
+@dp.callback_query(F.data.startswith('complaint:dep:'))
+async def complaint_dep(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call); dkey=call.data.split(':',2)[2]; await state.update_data(dkey=dkey); await state.set_state(ComplaintFSM.teacher)
+    await edit_or_send(call, "O‘qituvchini tanlang:", teachers_kb(dkey,'complaint:teacher','complaint:start'))
+@dp.callback_query(F.data.startswith('complaint:teacher:'))
+async def complaint_teacher(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call); _,_,dkey,tkey=call.data.split(':',3); await state.update_data(dkey=dkey,tkey=tkey); await state.set_state(ComplaintFSM.text)
+    await ask_input(call, f"<b>{safe(teacher_name(dkey,tkey))}</b> ustidan shikoyat matnini yozing:")
+@dp.message(ComplaintFSM.text)
+async def complaint_text(m:Message,state:FSMContext):
+    data=await state.get_data(); u=get_user(m.from_user.id); text=(m.text or '').strip()
+    if len(text)<5:
+        return await m.answer("Shikoyat matni juda qisqa. Iltimos, batafsilroq yozing.", reply_markup=cancel_kb())
+    dkey=data.get('dkey'); tkey=data.get('tkey')
+    if not dkey or not tkey:
+        await state.clear()
+        await m.answer("Jarayonda xatolik bo‘ldi. Iltimos, qaytadan urinib ko‘ring.", reply_markup=ReplyKeyboardRemove())
+        return await m.answer(home_text(), reply_markup=main_kb())
+    conn.execute("""INSERT INTO complaints(user_id,teacher_id,department_key,teacher_key,fullname,phone,username,complaint_text,message_text,created_at,status)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (m.from_user.id,tkey,dkey,tkey,u['fullname'] if u else '',u['phone'] if u else '',u['username'] if u else '',text,text,now_str(),'Yangi'))
+    conn.commit()
+    await state.clear()
+    await m.answer("✅ Shikoyatingiz saqlandi. Tez orada ko‘rib chiqiladi.", reply_markup=ReplyKeyboardRemove())
+    await m.answer(home_text(), reply_markup=main_kb())
+    admin_note = (
+        f"📢 Yangi shikoyat\n"
+        f"O‘qituvchi: {safe(teacher_name(dkey, tkey))}\n"
+        f"Foydalanuvchi: {safe(u['fullname'] if u else '')} | {safe(u['phone'] if u else '')}\n\n"
+        f"{safe(text[:1000])}"
     )
-    await callback.answer(tr(user_id, "Tasdiqlandi"))
+    asyncio.create_task(notify_admins(admin_note))
 
+@dp.callback_query(F.data == 'suggestion:start')
+async def suggestion_start(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call)
+    await state.clear()
+    if not user_registered(call.from_user.id):
+        return await start_registration(call,state,'suggestion')
+    await state.set_state(SuggestionFSM.text)
+    await ask_input(call, "💡 Taklifingizni yozing. Matn aniq va lo‘nda bo‘lsa, ko‘rib chiqish oson bo‘ladi:")
 
-@dp.callback_query(F.data == "go_vote_panel")
-async def go_vote_panel_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-
-    # Ovoz berishdan oldin obuna holati qayta tekshiriladi.
-    if not await check_user_subscription(user_id):
-        reset_access(user_id)
-        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
-        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
-        return
-
-    grant_access(user_id)
-    if has_voted(user_id):
-        await safe_edit_message(callback, get_already_voted_text(user_id), home_keyboard(user_id))
-        await callback.answer()
-        return
-    if not is_voting_open():
-        await safe_edit_message(callback, get_closed_text(user_id), home_keyboard(user_id))
-        await callback.answer()
-        return
-    await safe_edit_message(callback, get_subject_select_text(user_id), subjects_keyboard(user_id))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("subject:"))
-async def subject_select_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not require_access_only(user_id):
-        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
-        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
-        return
-    if has_voted(user_id):
-        await safe_edit_message(callback, get_already_voted_text(user_id), home_keyboard(user_id))
-        await callback.answer()
-        return
-    if not is_voting_open():
-        await safe_edit_message(callback, get_closed_text(user_id), home_keyboard(user_id))
-        await callback.answer()
-        return
-    subject_key = normalize_subject_key(callback.data.split(":")[1])
-    if subject_key not in get_subjects_from_db():
-        await callback.answer("Noto'g'ri bo'lim tanlandi.", show_alert=True)
-        return
-    await safe_edit_message(callback, get_teacher_select_text(user_id, subject_key), teachers_keyboard(user_id, subject_key))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("vote:"))
-async def vote_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not require_access_only(user_id):
-        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
-        return
-    if not is_voting_open():
-        await callback.answer(tr(user_id, "Hozir ovoz berish yopilgan."), show_alert=True)
-        return
-    if has_voted(user_id):
-        await callback.answer(tr(user_id, "Siz faqat 1 marta ovoz bera olasiz."), show_alert=True)
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer(tr(user_id, "Noto'g'ri tanlov."), show_alert=True)
-        return
-    _, subject_key, teacher_key = parts
-    subject_key = normalize_subject_key(subject_key)
-    if subject_key not in get_subjects_from_db() or teacher_key not in get_subjects_from_db().get(subject_key, {}).get("teachers", {}):
-        await callback.answer(tr(user_id, "Noto'g'ri tanlov."), show_alert=True)
-        return
-
-    text = (
-        f"❓ <b>Ovozingizni tasdiqlaysizmi?</b>\n\n"
-        f"<b>Kafedra:</b> {get_subject_name(subject_key)}\n"
-        f"<b>O'qituvchi:</b> {get_teacher_name(subject_key, teacher_key)}\n\n"
-        f"Tasdiqlagandan keyin asosiy ovozni qayta o'zgartirib bo'lmaydi."
+@dp.message(SuggestionFSM.text)
+async def suggestion_text(m:Message,state:FSMContext):
+    text=(m.text or '').strip()
+    if len(text)<5:
+        return await m.answer("Taklif matni juda qisqa. Iltimos, biroz batafsilroq yozing.", reply_markup=cancel_kb())
+    u=get_user(m.from_user.id)
+    conn.execute("""INSERT INTO suggestions(user_id,fullname,phone,username,suggestion_text,created_at,status)
+        VALUES(?,?,?,?,?,?,?)""", (m.from_user.id,u['fullname'] if u else '',u['phone'] if u else '',u['username'] if u else '',text,now_str(),'Yangi'))
+    conn.commit()
+    await state.clear()
+    await m.answer("✅ Taklifingiz qabul qilindi. Rahmat!", reply_markup=ReplyKeyboardRemove())
+    await m.answer(home_text(), reply_markup=main_kb())
+    admin_note = (
+        f"💡 Yangi taklif\n"
+        f"Foydalanuvchi: {safe(u['fullname'] if u else '')} | {safe(u['phone'] if u else '')}\n\n"
+        f"{safe(text[:1000])}"
     )
-    await safe_edit_message(callback, tr(user_id, text), confirm_vote_keyboard(user_id, subject_key, teacher_key))
-    await callback.answer()
+    asyncio.create_task(notify_admins(admin_note))
 
-
-@dp.callback_query(F.data.startswith("confirm_vote:"))
-async def confirm_vote_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not require_access_only(user_id):
-        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
-        return
-    if not is_voting_open():
-        await callback.answer(tr(user_id, "Hozir ovoz berish yopilgan."), show_alert=True)
-        return
-    if has_voted(user_id):
-        await callback.answer(tr(user_id, "Siz faqat 1 marta ovoz bera olasiz."), show_alert=True)
-        return
-
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer(tr(user_id, "Noto'g'ri tanlov."), show_alert=True)
-        return
-    _, subject_key, teacher_key = parts
-    subject_key = normalize_subject_key(subject_key)
-    if subject_key not in get_subjects_from_db() or teacher_key not in get_subjects_from_db().get(subject_key, {}).get("teachers", {}):
-        await callback.answer(tr(user_id, "Noto'g'ri tanlov."), show_alert=True)
-        return
-
-    try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except TelegramBadRequest:
-        pass
-
-    async with db_lock:
-        saved = save_vote(
-            user_id=user_id,
-            full_name=callback.from_user.full_name or "Noma'lum",
-            username=callback.from_user.username or "",
-            subject_key=subject_key,
-            teacher_key=teacher_key
-        )
-
-    if not saved:
-        await callback.answer(tr(user_id, "Siz allaqachon ovoz bergansiz."), show_alert=True)
-        await safe_edit_message(callback, get_already_voted_text(user_id), home_keyboard(user_id))
-        return
-
-    text = (
-        f"✅ <b>Ovoz muvaffaqiyatli qabul qilindi</b>\n\n"
-        f"<b>Bo'lim:</b> {get_subject_name(subject_key)}\n"
-        f"<b>Tanlovingiz:</b> {get_teacher_name(subject_key, teacher_key)}\n\n"
-        f"Rahmat, sizning ovozingiz saqlandi."
-    )
-    await safe_edit_message(callback, tr(user_id, text), after_vote_keyboard(user_id))
-    await callback.answer(tr(user_id, "Ovozingiz qabul qilindi!"))
-
-# =========================
-# RATING CALLBACKS
-# =========================
-@dp.callback_query(F.data == "go_rating_panel")
-async def go_rating_panel_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not require_access_only(user_id):
-        await safe_edit_message(callback, get_welcome_text(user_id), subscription_keyboard(user_id))
-        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
-        return
-    await safe_edit_message(callback, get_rating_select_text(user_id), rating_subjects_keyboard(user_id))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("rating_subject:"))
-async def rating_subject_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    subject_key = normalize_subject_key(callback.data.split(":", 1)[1])
-    if subject_key not in get_subjects_from_db():
-        await callback.answer(tr(user_id, "Noto'g'ri kafedra."), show_alert=True)
-        return
-    await safe_edit_message(callback, get_rating_teacher_text(user_id, subject_key), rating_teachers_keyboard(user_id, subject_key))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("rating_teacher:"))
-async def rating_teacher_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer(tr(user_id, "Noto'g'ri tanlov."), show_alert=True)
-        return
-    _, subject_key, teacher_key = parts
-    subject_key = normalize_subject_key(subject_key)
-    if subject_key not in get_subjects_from_db() or teacher_key not in get_subjects_from_db().get(subject_key, {}).get("teachers", {}):
-        await callback.answer(tr(user_id, "Noto'g'ri tanlov."), show_alert=True)
-        return
-    await safe_edit_message(callback, get_rate_text(user_id, subject_key, teacher_key), rate_keyboard(user_id, subject_key, teacher_key))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("rate:"))
-async def rate_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not require_access_only(user_id):
-        await callback.answer(get_subscription_required_alert(user_id), show_alert=True)
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 4:
-        await callback.answer("Noto'g'ri baho.", show_alert=True)
-        return
-    _, rating, subject_key, teacher_key = parts
-    subject_key = normalize_subject_key(subject_key)
-    if rating not in ("like", "dislike") or subject_key not in get_subjects_from_db() or teacher_key not in get_subjects_from_db().get(subject_key, {}).get("teachers", {}):
-        await callback.answer("Noto'g'ri baho.", show_alert=True)
-        return
-
-    async with db_lock:
-        save_teacher_rating(user_id, callback.from_user.full_name or "Noma'lum", callback.from_user.username or "", subject_key, teacher_key, rating)
-
-    await safe_edit_message(callback, get_rate_text(user_id, subject_key, teacher_key), rate_keyboard(user_id, subject_key, teacher_key))
-    await callback.answer(tr(user_id, "Bahoyingiz saqlandi!"))
-
-# =========================
-# USER RESULTS
-# =========================
-@dp.callback_query(F.data == "show_results_menu_user")
-async def show_results_menu_user(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    await safe_edit_message(callback, get_results_menu_text(user_id, False), results_menu_keyboard_user(user_id))
-    await callback.answer()
-
-@dp.callback_query(F.data == "show_results_user:general")
-async def show_results_user_general(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    async with db_lock:
-        text = add_refresh_time(get_general_results_text(user_id), user_id)
-    await safe_edit_message(callback, text, results_keyboard_user(user_id, "general"))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("show_results_user:"))
-async def show_results_user(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
-
-    if scope != "general" and scope not in get_subjects_from_db():
-        await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
-        return
-
-    async with db_lock:
-        text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-        text = add_refresh_time(text, user_id)
-
-    await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "refresh_results_user:general")
-async def refresh_results_user_general(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    refresh_key = "results_user:general"
-
-    if not can_start_refresh(user_id, refresh_key):
-        await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
-        return
-
-    try:
-        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-        async with db_lock:
-            text = add_refresh_time(get_general_results_text(user_id), user_id)
-        await safe_edit_message(callback, text, results_keyboard_user(user_id, "general"))
-    finally:
-        finish_refresh(user_id, refresh_key)
-
-@dp.callback_query(F.data.startswith("refresh_results_user:"))
-async def refresh_results_user(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
-    refresh_key = f"results_user:{scope}"
-
-    if not can_start_refresh(user_id, refresh_key):
-        await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
-        return
-
-    try:
-        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-
-        if scope != "general" and scope not in get_subjects_from_db():
-            await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
+# =====================================================
+# ADMIN HANDLERS
+# =====================================================
+def admin_required(func):
+    @wraps(func)
+    async def wrapper(event, *args, **kwargs):
+        uid=event.from_user.id
+        if not is_admin(uid):
+            if isinstance(event, CallbackQuery): await event.answer('Ruxsat yo‘q.', show_alert=True)
+            else: await event.answer('Ruxsat yo‘q.')
             return
-
-        async with db_lock:
-            text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-            text = add_refresh_time(text, user_id)
-
-        await safe_edit_message(callback, text, results_keyboard_user(user_id, scope))
-    finally:
-        finish_refresh(user_id, refresh_key)
-
-
-# =========================
-# ADMIN CALLBACKS
-# =========================
-@dp.callback_query(F.data == "back_admin_panel")
-async def back_admin_panel_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_results")
-async def admin_results_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    await safe_edit_message(callback, get_results_menu_text(user_id, True), results_menu_keyboard_admin(user_id))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "show_results_admin:general")
-async def show_results_admin_general(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    async with db_lock:
-        text = get_general_results_text(user_id)
-        text = add_refresh_time(text, user_id)
-    await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
-    await callback.answer()
-
-@dp.callback_query(F.data == "refresh_results_admin:general")
-async def refresh_results_admin_general(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    refresh_key = "results_admin:general"
-
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-
-    if not can_start_refresh(user_id, refresh_key):
-        await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
-        return
-
-    try:
-        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-        async with db_lock:
-            text = get_general_results_text(user_id)
-            text = add_refresh_time(text, user_id)
-        await safe_edit_message(callback, text, results_keyboard_admin(user_id, "general"))
-    finally:
-        finish_refresh(user_id, refresh_key)
-
-
-@dp.callback_query(F.data.startswith("show_results_admin:"))
-async def show_results_admin(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-
-    scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
-    if scope != "general" and scope not in get_subjects_from_db():
-        await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
-        return
-
-    async with db_lock:
-        text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-        text = add_refresh_time(text, user_id)
-
-    await safe_edit_message(callback, text, results_keyboard_admin(user_id, scope))
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("refresh_results_admin:"))
-async def refresh_results_admin_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-
-    scope = normalize_subject_key(callback.data.split(":", 1)[1].strip())
-    refresh_key = f"results_admin:{scope}"
-
-    if scope != "general" and scope not in get_subjects_from_db():
-        await callback.answer(tr(user_id, "Noto'g'ri bo'lim."), show_alert=True)
-        return
-
-    if not can_start_refresh(user_id, refresh_key):
-        await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
-        return
-
-    try:
-        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-        async with db_lock:
-            text = get_general_results_text(user_id) if scope == "general" else get_subject_results_text(user_id, scope)
-            text = add_refresh_time(text, user_id)
-
-        await safe_edit_message(callback, text, results_keyboard_admin(user_id, scope))
-    finally:
-        finish_refresh(user_id, refresh_key)
-
-
-@dp.callback_query(F.data == "admin_rating_stats")
-async def admin_rating_stats_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    await safe_edit_message(callback, "⭐️ <b>Baholash foizlari</b>\n\nKerakli bo'limni tanlang:", rating_results_menu_keyboard_admin(user_id))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("show_rating_stats:"))
-async def show_rating_stats_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    scope = normalize_subject_key(callback.data.split(":", 1)[1])
-    async with db_lock:
-        text = add_refresh_time(get_rating_stats_text(user_id, scope), user_id)
-    await safe_edit_message(callback, text, rating_stats_keyboard_admin(user_id, scope))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("refresh_rating_stats:"))
-async def refresh_rating_stats_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-
-    scope = normalize_subject_key(callback.data.split(":", 1)[1])
-    refresh_key = f"rating_stats:{scope}"
-
-    if not can_start_refresh(user_id, refresh_key):
-        await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
-        return
-
-    try:
-        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-        async with db_lock:
-            text = add_refresh_time(get_rating_stats_text(user_id, scope), user_id)
-        await safe_edit_message(callback, text, rating_stats_keyboard_admin(user_id, scope))
-    finally:
-        finish_refresh(user_id, refresh_key)
-
-
-@dp.callback_query(F.data == "admin_top_ratings")
-async def admin_top_ratings_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="admin_top_ratings"))
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    await safe_edit_message(callback, get_top_ratings_text(user_id), kb.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_top_votes")
-async def admin_top_votes_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="admin_top_votes"))
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    async with db_lock:
-        text = add_refresh_time(get_top_votes_text(user_id), user_id)
-    await safe_edit_message(callback, text, kb.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_teacher_stats")
-async def admin_teacher_stats_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    await safe_edit_message(callback, tr(user_id, "👤 <b>O'qituvchi statistikasi</b>\n\nKafedrani tanlang:"), teacher_stats_subjects_keyboard(user_id))
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("teacher_stats_subject:"))
-async def teacher_stats_subject_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    subject_key = normalize_subject_key(callback.data.split(":", 1)[1])
-    if subject_key not in get_subjects_from_db():
-        await callback.answer(tr(user_id, "Noto'g'ri kafedra."), show_alert=True)
-        return
-    await safe_edit_message(
-        callback,
-        tr(user_id, f"👤 <b>{get_subject_name(subject_key)}</b>\n\nStatistika uchun o'qituvchini tanlang:"),
-        teacher_stats_teachers_keyboard(user_id, subject_key)
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("teacher_stats:"))
-async def teacher_stats_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer(tr(user_id, "Noto'g'ri tanlov."), show_alert=True)
-        return
-    _, subject_key, teacher_key = parts
-    subject_key = normalize_subject_key(subject_key)
-    await safe_edit_message(callback, get_teacher_detailed_stats_text(user_id, subject_key, teacher_key), teacher_stats_keyboard(user_id, subject_key))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "admin_backup")
-async def admin_backup_handler(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    await callback.answer("Backup tayyorlanmoqda...")
-    try:
-        async with db_lock:
-            backup_path = create_backup_zip()
-        await callback.message.answer_document(
-            FSInputFile(backup_path),
-            caption="💾 Backup: votes.db, ovozlar Excel, rating Excel va shikoyatlar fayli."
-        )
-    except Exception as e:
-        logging.error(f"Backup yaratishda xatolik: {e}")
-        await callback.message.answer(f"❌ Backup yaratishda xatolik: {e}")
-
-
-@dp.callback_query(F.data == "admin_complaints")
-async def admin_complaints_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    async with db_lock:
-        text = add_refresh_time(get_complaints_text(user_id), user_id)
-    await safe_edit_message(callback, text, complaints_keyboard_admin(user_id))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "refresh_admin_complaints")
-async def refresh_admin_complaints_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    refresh_key = "admin_complaints"
-
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-
-    if not can_start_refresh(user_id, refresh_key):
-        await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
-        return
-
-    try:
-        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-        async with db_lock:
-            text = add_refresh_time(get_complaints_text(user_id), user_id)
-        await safe_edit_message(callback, text, complaints_keyboard_admin(user_id))
-    finally:
-        finish_refresh(user_id, refresh_key)
-
-
-@dp.callback_query(F.data == "admin_export_complaints_docx")
-async def admin_export_complaints_docx_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    filename = export_complaints_to_docx()
-    await callback.message.answer_document(
-        FSInputFile(filename),
-        caption="📄 Shikoyat va takliflar Word fayl ko'rinishida."
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "admin_users")
-async def admin_users_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    async with db_lock:
-        text = add_refresh_time(get_users_text(user_id), user_id)
-    await safe_edit_message(callback, text, users_keyboard_admin(user_id))
-    await callback.answer()
-
-@dp.callback_query(F.data == "refresh_admin_users")
-async def refresh_admin_users(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    refresh_key = "admin_users"
-
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-
-    if not can_start_refresh(user_id, refresh_key):
-        await callback.answer(tr(user_id, "Juda tez bosyapsiz. 1-2 soniyadan keyin urinib ko'ring."), show_alert=False)
-        return
-
-    try:
-        await callback.answer(tr(user_id, "Yangilanmoqda..."), show_alert=False)
-        async with db_lock:
-            text = add_refresh_time(get_users_text(user_id), user_id)
-        await safe_edit_message(callback, text, users_keyboard_admin(user_id))
-    finally:
-        finish_refresh(user_id, refresh_key)
-
-
-@dp.callback_query(F.data == "admin_export_votes_excel")
-async def admin_export_votes_excel_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    filename = export_votes_to_excel()
-    await callback.message.answer_document(FSInputFile(filename), caption="📁 Ovozlar Excel fayl ko'rinishida.")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_export_rating_excel")
-async def admin_export_rating_excel_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    filename = export_rating_to_excel()
-    await callback.message.answer_document(FSInputFile(filename), caption="📁 Rating Excel fayl ko'rinishida.")
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_export_users_excel")
-async def admin_export_users_excel_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    async with db_lock:
-        filename = export_users_to_excel()
-    await callback.message.answer_document(
-        FSInputFile(filename),
-        caption="👥 Foydalanuvchilar Excel fayl ko'rinishida."
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_open")
-async def admin_open_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    open_voting()
-    await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
-    await callback.answer("Voting ochildi!")
-
-@dp.callback_query(F.data == "admin_close")
-async def admin_close_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    close_voting()
-    await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
-    await callback.answer("Voting yopildi!")
-
-@dp.callback_query(F.data == "admin_reset_votes_confirm")
-async def admin_reset_votes_confirm_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    await safe_edit_message(callback, "⚠️ <b>Diqqat!</b>\n\nBarcha ovozlar o'chiriladi.\nDavom etasizmi?", reset_confirm_keyboard(user_id, "votes"))
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_reset_rating_confirm")
-async def admin_reset_rating_confirm_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    await safe_edit_message(callback, "⚠️ <b>Diqqat!</b>\n\nBarcha rating baholari o'chiriladi.\nDavom etasizmi?", reset_confirm_keyboard(user_id, "rating"))
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_reset_complaints_confirm")
-async def admin_reset_complaints_confirm_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    await safe_edit_message(
-        callback,
-        "⚠️ <b>Diqqat!</b>\n\nBarcha shikoyat va takliflar o'chiriladi.\nDavom etasizmi?",
-        reset_confirm_keyboard(user_id, "complaints")
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_reset_complaints")
-async def admin_reset_complaints_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    async with db_lock:
-        reset_complaints()
-    await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
-    await callback.answer("Shikoyat va takliflar tozalandi!")
-
-@dp.callback_query(F.data == "cancel_reset")
-async def cancel_reset_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
-    await callback.answer(tr(user_id, "Bekor qilindi"))
-
-@dp.callback_query(F.data == "admin_reset_votes")
-async def admin_reset_votes_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    async with db_lock:
-        reset_votes()
-    await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
-    await callback.answer("Ovozlar reset qilindi!")
-
-@dp.callback_query(F.data == "admin_reset_rating")
-async def admin_reset_rating_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    async with db_lock:
-        reset_ratings()
-    await safe_edit_message(callback, get_admin_panel_text(user_id), admin_panel_keyboard(user_id))
-    await callback.answer("Rating reset qilindi!")
-
-
-# FIX #6: Keraksiz takroriy callbacklar olib tashlandi.
-# admin_complaints_word, admin_export_complaints_word, admin_export, admin_reset_confirm,
-# admin_reset — bular yo'q yoki birining nomi bilan almashtirilib qolgan edi.
-# Eski nomlar hali ham ishlashi kerak bo'lsa, quyida saqlanadi:
-
-@dp.callback_query(F.data == "admin_export")
-async def admin_export_callback(callback: CallbackQuery):
-    await admin_export_votes_excel_callback(callback)
-
-@dp.callback_query(F.data == "admin_reset_confirm")
-async def admin_reset_confirm_old_callback(callback: CallbackQuery):
-    await admin_reset_votes_confirm_callback(callback)
-
-@dp.callback_query(F.data == "admin_reset")
-async def admin_reset_old_callback(callback: CallbackQuery):
-    await admin_reset_votes_callback(callback)
-
-# =========================
-
-# =========================
-# ADMIN DB MANAGE FUNCTIONS
-# =========================
-def db_add_subject(subject_key: str, subject_name: str) -> bool:
-    try:
-        cursor.execute("SELECT MAX(sort_order) FROM db_subjects")
-        row = cursor.fetchone()
-        max_order = (row[0] or 0) + 1
-        cursor.execute("INSERT INTO db_subjects (subject_key, subject_name, sort_order) VALUES (?, ?, ?)",
-                       (subject_key, subject_name, max_order))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-
-def db_edit_subject(subject_key: str, new_name: str) -> bool:
-    cursor.execute("UPDATE db_subjects SET subject_name = ? WHERE subject_key = ?", (new_name, subject_key))
-    conn.commit()
-    return cursor.rowcount > 0
-
-def db_delete_subject(subject_key: str) -> bool:
-    cursor.execute("DELETE FROM db_teachers WHERE subject_key = ?", (subject_key,))
-    cursor.execute("DELETE FROM db_subjects WHERE subject_key = ?", (subject_key,))
-    conn.commit()
+        return await func(event,*args,**kwargs)
+    return wrapper
+
+@dp.callback_query(F.data == 'admin:menu')
+@admin_required
+async def admin_menu(call:CallbackQuery): await answer_cb(call); await edit_or_send(call,"<b>Admin panel</b>",admin_kb())
+@dp.callback_query(F.data == 'admin:dash')
+@admin_required
+async def admin_dash(call:CallbackQuery):
+    await answer_cb(call)
+    users=conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]; ratings=conn.execute('SELECT COUNT(*) FROM ratings').fetchone()[0]; comps=conn.execute('SELECT COUNT(*) FROM complaints').fetchone()[0]; suggs=conn.execute('SELECT COUNT(*) FROM suggestions').fetchone()[0]
+    txt=f"📊 <b>Dashboard</b>\n\nFoydalanuvchilar: <b>{users}</b>\nBaholar: <b>{ratings}</b>\nShikoyatlar: <b>{comps}</b>\nTakliflar: <b>{suggs}</b>\nBaholash: <b>{'Ochiq' if setting_bool('voting_open') else 'Yopiq'}</b>"
+    await edit_or_send(call,txt,ik([[('⬅️ Admin','admin:menu')]]))
+@dp.callback_query(F.data == 'admin:teachers')
+@admin_required
+async def adm_teachers(call:CallbackQuery): await answer_cb(call); await edit_or_send(call,"👨‍🏫 <b>O‘qituvchilar</b>",admin_teachers_kb())
+@dp.callback_query(F.data == 'tm:list')
+@admin_required
+async def tm_list(call:CallbackQuery): await answer_cb(call); await edit_or_send(call,"Kafedrani tanlang:",deps_kb('tm:listdep','admin:teachers'))
+@dp.callback_query(F.data.startswith('tm:listdep:'))
+@admin_required
+async def tm_listdep(call:CallbackQuery):
+    await answer_cb(call); dkey=call.data.split(':',2)[2]
+    rows=[]
+    for t in teachers(dkey,False):
+        icon='✅' if t['is_active'] else '❌'
+        rows.append([(f"{icon} {t['name'][:35]}", f"tm:detail:{dkey}:{t['teacher_key']}")])
+    rows.append([('⬅️ Orqaga','tm:list')])
+    await edit_or_send(call,f"<b>{safe(dep_name(dkey))}</b>\nO‘qituvchini tanlang:",InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=a, callback_data=b) for a,b in r] for r in rows]))
+
+@dp.callback_query(F.data.startswith('tm:detail:'))
+@admin_required
+async def tm_detail(call:CallbackQuery):
+    await answer_cb(call); _,_,dkey,tkey=call.data.split(':',3)
+    st=teacher_stats(dkey,tkey); active=conn.execute("SELECT is_active FROM teachers WHERE department_key=? AND teacher_key=?",(dkey,tkey)).fetchone()[0]
+    txt=f"<b>{safe(teacher_name(dkey,tkey))}</b>\nKafedra: {safe(dep_name(dkey))}\nHolat: {'Faol' if active else 'Arxiv'}\nO‘quvchilar soni: <b>{st['student_count']}</b>\nOvozlar: <b>{st['total']}</b>\nO‘rtacha: <b>{st['avg']:.2f}</b>"
+    kb=ik([[('✏️ Ism','tm:editname:'+dkey+':'+tkey),('👥 O‘quvchi','tm:editstudents:'+dkey+':'+tkey)],[('📊 Statistika','stats:teacher:'+dkey+':'+tkey),('🗑 Arxivlash','del_teacher:'+dkey+':'+tkey)],[('♻️ Tiklash','restore_teacher:'+dkey+':'+tkey)],[('⬅️ Ro‘yxat','tm:listdep:'+dkey)]])
+    await edit_or_send(call,txt,kb)
+@dp.callback_query(F.data == 'tm:add')
+@admin_required
+async def tm_add(call:CallbackQuery,state:FSMContext): await answer_cb(call); await state.set_state(TeacherFSM.add_department); await edit_or_send(call,"Qaysi kafedraga qo‘shiladi?",deps_kb('tm:adddep','admin:teachers'))
+@dp.callback_query(F.data.startswith('tm:adddep:'))
+@admin_required
+async def tm_adddep(call:CallbackQuery,state:FSMContext): await answer_cb(call); dkey=call.data.split(':',2)[2]; await state.update_data(dkey=dkey); await state.set_state(TeacherFSM.add_name); await ask_input(call,"Yangi o‘qituvchi F.I.Sh ni kiriting:")
+@dp.message(TeacherFSM.add_name)
+@admin_required
+async def tm_addname(m:Message,state:FSMContext):
+    data=await state.get_data(); name=(m.text or '').strip()
+    if len(name)<3: return await m.answer('F.I.Sh juda qisqa.')
+    key=slug(name,'t')
+    conn.execute("INSERT OR IGNORE INTO teachers(teacher_key,department_key,name,created_at) VALUES(?,?,?,?)",(key,data['dkey'],name,now_str())); conn.commit(); await state.clear(); await m.answer("✅ O‘qituvchi qo‘shildi.",reply_markup=admin_teachers_kb())
+@dp.callback_query(F.data == 'tm:students')
+@admin_required
+async def tm_students(call:CallbackQuery): await answer_cb(call); await edit_or_send(call,"Kafedrani tanlang:",deps_kb('tm:studentsdep','admin:teachers'))
+@dp.callback_query(F.data.startswith('tm:studentsdep:'))
+@admin_required
+async def tm_studentsdep(call:CallbackQuery): await answer_cb(call); dkey=call.data.split(':',2)[2]; await edit_or_send(call,"O‘qituvchini tanlang:",teachers_kb(dkey,'tm:studentteacher','tm:students'))
+@dp.callback_query(F.data.startswith('tm:studentteacher:'))
+@admin_required
+async def tm_studentteacher(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call); _,_,dkey,tkey=call.data.split(':',3); await state.update_data(dkey=dkey,tkey=tkey); await state.set_state(TeacherFSM.student_count)
+    st=teacher_stats(dkey,tkey); action='✏️ O‘zgartirish' if st['student_count'] else '➕ Kiritish'
+    await ask_input(call,f"{safe(teacher_name(dkey,tkey))}\nHozirgi o‘quvchilar soni: <b>{st['student_count']}</b>\n\n{action}: yangi sonni kiriting.")
+@dp.message(TeacherFSM.student_count)
+@admin_required
+async def tm_student_save(m:Message,state:FSMContext):
+    if not (m.text or "").isdigit(): return await m.answer("Faqat raqam kiriting.", reply_markup=cancel_kb())
+    data=await state.get_data(); conn.execute("UPDATE teachers SET student_count=? WHERE department_key=? AND teacher_key=?",(int(m.text),data['dkey'],data['tkey'])); conn.commit(); await state.clear(); await m.answer("✅ Saqlandi.",reply_markup=admin_teachers_kb())
+@dp.callback_query(F.data == 'tm:search')
+@admin_required
+async def tm_search(call:CallbackQuery,state:FSMContext): await answer_cb(call); await state.set_state(TeacherFSM.search); await ask_input(call,"Qidirish uchun ism/familiya kiriting:")
+@dp.message(TeacherFSM.search)
+@admin_required
+async def tm_search_msg(m:Message,state:FSMContext):
+    query=(m.text or "").strip()
+    if len(query) < 2: return await m.answer("Qidiruv so‘zi juda qisqa.", reply_markup=cancel_kb())
+    q=f"%{query}%"; rows=conn.execute("SELECT t.*,d.name dep FROM teachers t JOIN departments d ON d.department_key=t.department_key WHERE t.name LIKE ? LIMIT 30",(q,)).fetchall(); await state.clear()
+    if not rows: return await m.answer("Topilmadi.",reply_markup=admin_teachers_kb())
+    await m.answer('\n\n'.join([f"<b>{safe(r['name'])}</b>\n{safe(r['dep'])}\nO‘quvchi: {r['student_count'] or 0}" for r in rows]),reply_markup=admin_teachers_kb())
+
+@dp.callback_query(F.data == 'admin:tstats')
+@admin_required
+async def adm_tstats(call:CallbackQuery): await answer_cb(call); await edit_or_send(call,"Kafedrani tanlang:",deps_kb('stats:dep','admin:menu'))
+@dp.callback_query(F.data.startswith('stats:dep:'))
+@admin_required
+async def stats_dep(call:CallbackQuery): await answer_cb(call); dkey=call.data.split(':',2)[2]; await edit_or_send(call,"O‘qituvchini tanlang:",teachers_kb(dkey,'stats:teacher','admin:tstats'))
+@dp.callback_query(F.data.startswith('stats:teacher:'))
+@admin_required
+async def stats_teacher(call:CallbackQuery):
+    await answer_cb(call); _,_,dkey,tkey=call.data.split(':',3)
+    kb=ik([[('📢 Shikoyatlar',f'complaints:teacher:{dkey}:{tkey}')],[('✏️ Tahrirlash',f'edit_teacher:{dkey}:{tkey}'),('🗑 O‘chirish',f'del_teacher:{dkey}:{tkey}')],[('⬅️ Orqaga',f'stats:dep:{dkey}')]])
+    await edit_or_send(call,teacher_stats_text(dkey,tkey),kb)
+@dp.callback_query(F.data.startswith('complaints:teacher:'))
+@admin_required
+async def complaints_teacher(call:CallbackQuery):
+    await answer_cb(call); _,_,dkey,tkey=call.data.split(':',3)
+    rows=conn.execute("SELECT * FROM complaints WHERE department_key=? AND teacher_key=? ORDER BY id DESC LIMIT 20",(dkey,tkey)).fetchall()
+    txt=f"📢 <b>{safe(teacher_name(dkey,tkey))} ustidan shikoyatlar</b>\n\n" + ('Hali mavjud emas.' if not rows else '\n\n'.join([f"#{r['id']} • {safe(r['status'])} • {safe(r['created_at'])}\n{safe(r['complaint_text'] or r['message_text'])}" for r in rows]))
+    await edit_or_send(call,txt[:4000],ik([[('⬅️ Orqaga',f'stats:teacher:{dkey}:{tkey}')]]))
+@dp.callback_query(F.data.startswith('del_teacher:'))
+@admin_required
+async def del_teacher(call:CallbackQuery): await answer_cb(call); _,dkey,tkey=call.data.split(':',2); conn.execute("UPDATE teachers SET is_active=0 WHERE department_key=? AND teacher_key=?",(dkey,tkey)); conn.commit(); await edit_or_send(call,"✅ O‘qituvchi o‘chirildi (arxivlandi).",admin_teachers_kb())
+
+
+@dp.callback_query(F.data.startswith('tm:editname:'))
+@admin_required
+async def tm_edit_name_start(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call); _,_,dkey,tkey=call.data.split(':',3)
+    await state.update_data(dkey=dkey,tkey=tkey); await state.set_state(TeacherEditFSM.name)
+    await ask_input(call,f"Hozirgi nom: <b>{safe(teacher_name(dkey,tkey))}</b>\n\nYangi F.I.Sh ni kiriting:")
+
+@dp.message(TeacherEditFSM.name)
+@admin_required
+async def tm_edit_name_save(m:Message,state:FSMContext):
+    name=(m.text or '').strip()
+    if len(name)<3: return await m.answer("Nom juda qisqa.")
+    data=await state.get_data(); conn.execute("UPDATE teachers SET name=? WHERE department_key=? AND teacher_key=?",(name,data['dkey'],data['tkey'])); conn.commit(); await state.clear()
+    await m.answer("✅ O‘qituvchi nomi yangilandi.", reply_markup=admin_teachers_kb())
+
+@dp.callback_query(F.data.startswith('tm:editstudents:'))
+@admin_required
+async def tm_edit_students_start(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call); _,_,dkey,tkey=call.data.split(':',3)
+    await state.update_data(dkey=dkey,tkey=tkey); await state.set_state(TeacherEditFSM.student_count)
+    await ask_input(call,f"{safe(teacher_name(dkey,tkey))}\nYangi o‘quvchilar sonini kiriting:")
+
+@dp.message(TeacherEditFSM.student_count)
+@admin_required
+async def tm_edit_students_save(m:Message,state:FSMContext):
+    if not (m.text or '').isdigit(): return await m.answer("Faqat raqam kiriting.", reply_markup=cancel_kb())
+    data=await state.get_data(); conn.execute("UPDATE teachers SET student_count=? WHERE department_key=? AND teacher_key=?",(int(m.text),data['dkey'],data['tkey'])); conn.commit(); await state.clear()
+    await m.answer("✅ O‘quvchilar soni yangilandi.", reply_markup=admin_teachers_kb())
+
+@dp.callback_query(F.data.startswith('edit_teacher:'))
+@admin_required
+async def edit_teacher_alias(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call); _,dkey,tkey=call.data.split(':',2)
+    await state.update_data(dkey=dkey,tkey=tkey); await state.set_state(TeacherEditFSM.name)
+    await ask_input(call,f"Hozirgi nom: <b>{safe(teacher_name(dkey,tkey))}</b>\n\nYangi F.I.Sh ni kiriting:")
+
+@dp.callback_query(F.data.startswith('restore_teacher:'))
+@admin_required
+async def restore_teacher(call:CallbackQuery):
+    await answer_cb(call); _,dkey,tkey=call.data.split(':',2)
+    conn.execute("UPDATE teachers SET is_active=1 WHERE department_key=? AND teacher_key=?",(dkey,tkey)); conn.commit()
+    await edit_or_send(call,"✅ O‘qituvchi tiklandi.",admin_teachers_kb())
+
+@dp.callback_query(F.data == 'dep:manage')
+@admin_required
+async def dep_manage(call:CallbackQuery):
+    await answer_cb(call)
+    await edit_or_send(call,"🏛 <b>Kafedralar boshqaruvi</b>",ik([[('➕ Qo‘shish','dep:add'),('📋 Ro‘yxat','dep:list')],[('⬅️ O‘qituvchilar','admin:teachers')]]))
+
+@dp.callback_query(F.data == 'dep:list')
+@admin_required
+async def dep_list(call:CallbackQuery):
+    await answer_cb(call)
+    rows=[[(('✅ ' if d['is_active'] else '❌ ')+d['name'][:35], f"dep:detail:{d['department_key']}")] for d in departments(False)]
+    rows.append([('⬅️ Orqaga','dep:manage')])
+    await edit_or_send(call,"Kafedrani tanlang:",InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=a, callback_data=b) for a,b in r] for r in rows]))
+
+@dp.callback_query(F.data.startswith('dep:detail:'))
+@admin_required
+async def dep_detail(call:CallbackQuery):
+    await answer_cb(call); dkey=call.data.split(':',2)[2]
+    d=conn.execute("SELECT * FROM departments WHERE department_key=?",(dkey,)).fetchone(); st=department_stats(dkey)
+    txt=f"<b>{safe(d['name'])}</b>\nHolat: {'Faol' if d['is_active'] else 'Arxiv'}\nO‘qituvchilar: <b>{st['teachers']}</b>\nBaholar: <b>{st['votes']}</b>\nFinal score: <b>{st['final']:.3f}</b>"
+    await edit_or_send(call,txt,ik([[('✏️ Nom','dep:edit:'+dkey),('🗑 Arxiv','dep:archive:'+dkey)],[('♻️ Tiklash','dep:restore:'+dkey)],[('⬅️ Ro‘yxat','dep:list')]]))
+
+@dp.callback_query(F.data == 'dep:add')
+@admin_required
+async def dep_add_start(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call); await state.set_state(DepartmentFSM.add_name); await ask_input(call,"Yangi kafedra nomini kiriting:")
+
+@dp.message(DepartmentFSM.add_name)
+@admin_required
+async def dep_add_save(m:Message,state:FSMContext):
+    name=(m.text or '').strip()
+    if len(name)<3: return await m.answer("Nom juda qisqa.")
+    key=slug(name,'d'); order=conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM departments").fetchone()[0]
+    conn.execute("INSERT INTO departments(department_key,name,sort_order,created_at) VALUES(?,?,?,?)",(key,name,order,now_str())); conn.commit(); await state.clear()
+    await m.answer("✅ Kafedra qo‘shildi.", reply_markup=admin_teachers_kb())
+
+@dp.callback_query(F.data.startswith('dep:edit:'))
+@admin_required
+async def dep_edit_start(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call); dkey=call.data.split(':',2)[2]; await state.update_data(dkey=dkey); await state.set_state(DepartmentFSM.edit_name)
+    await ask_input(call,f"Hozirgi nom: <b>{safe(dep_name(dkey))}</b>\nYangi nomni kiriting:")
+
+@dp.message(DepartmentFSM.edit_name)
+@admin_required
+async def dep_edit_save(m:Message,state:FSMContext):
+    name=(m.text or '').strip()
+    if len(name)<3: return await m.answer("Nom juda qisqa.")
+    data=await state.get_data(); conn.execute("UPDATE departments SET name=? WHERE department_key=?",(name,data['dkey'])); conn.commit(); await state.clear()
+    await m.answer("✅ Kafedra yangilandi.", reply_markup=admin_teachers_kb())
+
+@dp.callback_query(F.data.startswith('dep:archive:'))
+@admin_required
+async def dep_archive(call:CallbackQuery):
+    await answer_cb(call); dkey=call.data.split(':',2)[2]; conn.execute("UPDATE departments SET is_active=0 WHERE department_key=?",(dkey,)); conn.commit(); await edit_or_send(call,"✅ Kafedra arxivlandi.",admin_teachers_kb())
+
+@dp.callback_query(F.data.startswith('dep:restore:'))
+@admin_required
+async def dep_restore(call:CallbackQuery):
+    await answer_cb(call); dkey=call.data.split(':',2)[2]; conn.execute("UPDATE departments SET is_active=1 WHERE department_key=?",(dkey,)); conn.commit(); await edit_or_send(call,"✅ Kafedra tiklandi.",admin_teachers_kb())
+
+@dp.callback_query(F.data.startswith('complaint:status:'))
+@admin_required
+async def complaint_status(call:CallbackQuery):
+    await answer_cb(call); _,_,cid,status=call.data.split(':',3)
+    status_map={'new':'Yangi','process':'Ko‘rib chiqilmoqda','closed':'Yopilgan'}
+    conn.execute("UPDATE complaints SET status=? WHERE id=?",(status_map.get(status,'Yangi'),cid)); conn.commit()
+    await edit_or_send(call,"✅ Shikoyat statusi yangilandi.",ik([[('📢 Shikoyatlar','admin:complaints')],[('⬅️ Admin','admin:menu')]]))
+
+@dp.callback_query(F.data == 'admin:dept_rating')
+@admin_required
+async def adm_dep_rating(call:CallbackQuery): await answer_cb(call); await edit_or_send(call,departments_rating_text(),ik([[('⬅️ Admin','admin:menu')]]))
+@dp.callback_query(F.data == 'admin:complaints')
+@admin_required
+async def adm_complaints(call:CallbackQuery):
+    await answer_cb(call); rows=conn.execute("SELECT * FROM complaints ORDER BY id DESC LIMIT 30").fetchall()
+    if not rows:
+        return await edit_or_send(call,"📢 <b>Shikoyatlar</b>\n\nMavjud emas.",ik([[('⬅️ Admin','admin:menu')]]))
+    kb_rows=[[(f"#{r['id']} • {r['status']} • {teacher_name(r['department_key'],r['teacher_key'])[:24]}", f"complaint:view:{r['id']}")] for r in rows]
+    kb_rows.append([('⬅️ Admin','admin:menu')])
+    await edit_or_send(call,"📢 <b>Shikoyatlar</b>\nBittasini tanlang:",InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=a, callback_data=b) for a,b in row] for row in kb_rows]))
+
+@dp.callback_query(F.data.startswith('complaint:view:'))
+@admin_required
+async def complaint_view(call:CallbackQuery):
+    await answer_cb(call); cid=call.data.split(':',2)[2]
+    r=conn.execute("SELECT * FROM complaints WHERE id=?",(cid,)).fetchone()
+    if not r: return await edit_or_send(call,"Topilmadi.",ik([[('⬅️ Orqaga','admin:complaints')]]))
+    txt=f"📢 <b>Shikoyat #{r['id']}</b>\nStatus: <b>{safe(r['status'])}</b>\nFoydalanuvchi: {safe(r['fullname'])} | {safe(r['phone'])}\nKafedra: {safe(dep_name(r['department_key']))}\nO‘qituvchi: {safe(teacher_name(r['department_key'],r['teacher_key']))}\nSana: {safe(r['created_at'])}\n\n{safe(r['complaint_text'] or r['message_text'])}"
+    kb=ik([[('Yangi','complaint:status:'+cid+':new'),('Jarayonda','complaint:status:'+cid+':process'),('Yopilgan','complaint:status:'+cid+':closed')],[('⬅️ Ro‘yxat','admin:complaints')]])
+    await edit_or_send(call,txt[:4000],kb)
+@dp.callback_query(F.data == 'admin:suggestions')
+@admin_required
+async def adm_suggestions(call:CallbackQuery):
+    await answer_cb(call)
+    rows=conn.execute("SELECT * FROM suggestions ORDER BY id DESC LIMIT 30").fetchall()
+    if not rows:
+        return await edit_or_send(call,"💡 <b>Takliflar</b>\n\nMavjud emas.",ik([[('⬅️ Admin','admin:menu')]]))
+    kb_rows=[[(f"#{r['id']} • {r['status']} • {(r['fullname'] or 'Foydalanuvchi')[:24]}", f"suggestion:view:{r['id']}")] for r in rows]
+    kb_rows.append([('⬅️ Admin','admin:menu')])
+    await edit_or_send(call,"💡 <b>Takliflar</b>\nBittasini tanlang:",InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=a, callback_data=b) for a,b in row] for row in kb_rows]))
+
+@dp.callback_query(F.data.startswith('suggestion:view:'))
+@admin_required
+async def suggestion_view(call:CallbackQuery):
+    await answer_cb(call); sid=call.data.split(':',2)[2]
+    r=conn.execute("SELECT * FROM suggestions WHERE id=?",(sid,)).fetchone()
+    if not r: return await edit_or_send(call,"Topilmadi.",ik([[('⬅️ Orqaga','admin:suggestions')]]))
+    txt=f"💡 <b>Taklif #{r['id']}</b>\nStatus: <b>{safe(r['status'])}</b>\nFoydalanuvchi: {safe(r['fullname'])} | {safe(r['phone'])}\nSana: {safe(r['created_at'])}\n\n{safe(r['suggestion_text'])}"
+    kb=ik([[('Yangi','suggestion:status:'+sid+':new'),('Jarayonda','suggestion:status:'+sid+':process'),('Yopilgan','suggestion:status:'+sid+':closed')],[('⬅️ Ro‘yxat','admin:suggestions')]])
+    await edit_or_send(call,txt[:4000],kb)
+
+@dp.callback_query(F.data.startswith('suggestion:status:'))
+@admin_required
+async def suggestion_status(call:CallbackQuery):
+    await answer_cb(call); _,_,sid,status=call.data.split(':',3)
+    status_map={'new':'Yangi','process':'Ko‘rib chiqilmoqda','closed':'Yopilgan'}
+    conn.execute("UPDATE suggestions SET status=? WHERE id=?",(status_map.get(status,'Yangi'),sid)); conn.commit()
+    await edit_or_send(call,"✅ Taklif statusi yangilandi.",ik([[('💡 Takliflar','admin:suggestions')],[('⬅️ Admin','admin:menu')]]))
+
+@dp.callback_query(F.data == 'admin:export')
+@admin_required
+async def adm_export(call:CallbackQuery): await answer_cb(call); await edit_or_send(call,"📁 <b>Export / Backup</b>",ik([[('Excel export','export:excel'),('Backup ZIP','export:backup')],[('⬅️ Admin','admin:menu')]]))
+@dp.callback_query(F.data == 'export:excel')
+@admin_required
+async def export_excel_cb(call:CallbackQuery):
+    await answer_cb(call,'Tayyorlanmoqda...'); path=export_all_excel(); await call.message.answer_document(FSInputFile(path), caption='Excel export tayyor.')
+@dp.callback_query(F.data == 'export:backup')
+@admin_required
+async def export_backup_cb(call:CallbackQuery):
+    await answer_cb(call,'Backup tayyorlanmoqda...'); path=make_backup(); await call.message.answer_document(FSInputFile(path), caption='Backup ZIP tayyor.')
+@dp.callback_query(F.data == 'admin:settings')
+@admin_required
+async def adm_settings(call:CallbackQuery): await answer_cb(call); await edit_or_send(call,"⚙️ <b>Sozlamalar</b>",admin_settings_kb())
+@dp.callback_query(F.data == 'set:voting')
+@admin_required
+async def set_voting(call:CallbackQuery):
+    await answer_cb(call); cur=setting_bool('voting_open'); set_setting('voting_open','0' if cur else '1')
+    await edit_or_send(call,f"Baholash holati: <b>{'Ochiq' if not cur else 'Yopiq'}</b>",admin_settings_kb())
+@dp.callback_query(F.data == 'set:deps')
+@admin_required
+async def set_deps(call:CallbackQuery): await dep_manage(call)
+
+@dp.callback_query(F.data == 'set:complaints')
+@admin_required
+async def set_complaints(call:CallbackQuery): await adm_complaints(call)
+
+@dp.callback_query(F.data == 'set:rating')
+@admin_required
+async def set_rating(call:CallbackQuery):
+    await answer_cb(call); await edit_or_send(call,departments_rating_text(),ik([[('⬅️ Sozlamalar','admin:settings')]]))
+
+@dp.callback_query(F.data == 'set:backup')
+@admin_required
+async def set_backup(call:CallbackQuery):
+    await answer_cb(call); cur=setting_bool('daily_backup');
+    await edit_or_send(call,f"📦 Backup sozlamalari\nAvtomatik backup: <b>{'Yoqilgan' if cur else 'O‘chirilgan'}</b>",ik([[('On/Off','backup:toggle'),('Manual backup','export:backup')],[('⬅️ Sozlamalar','admin:settings')]]))
+
+@dp.callback_query(F.data == 'backup:toggle')
+@admin_required
+async def backup_toggle(call:CallbackQuery):
+    await answer_cb(call); cur=setting_bool('daily_backup'); set_setting('daily_backup','0' if cur else '1'); await set_backup(call)
+
+@dp.callback_query(F.data == 'set:admins')
+@admin_required
+async def set_admins(call:CallbackQuery):
+    await answer_cb(call); extra=get_setting('extra_admins','') or 'yo‘q'
+    await edit_or_send(call,f"🔐 Adminlar\nAsosiy ADMIN_IDS: <code>{','.join(map(str,ADMIN_IDS))}</code>\nQo‘shimcha: <code>{safe(extra)}</code>",ik([[('➕ Admin qo‘shish','admin:add'),('➖ Admin olish','admin:remove')],[('⬅️ Sozlamalar','admin:settings')]]))
+
+@dp.callback_query(F.data == 'admin:add')
+@admin_required
+async def admin_add_start(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call); await state.set_state(AdminFSM.admin_add); await ask_input(call,"Yangi admin Telegram ID raqamini kiriting:")
+
+@dp.message(AdminFSM.admin_add)
+@admin_required
+async def admin_add_save(m:Message,state:FSMContext):
+    if not (m.text or '').strip().isdigit(): return await m.answer("Faqat Telegram ID raqam kiriting.", reply_markup=cancel_kb())
+    ids=set(filter(None,get_setting('extra_admins','').split(','))); ids.add(m.text.strip()); set_setting('extra_admins',','.join(sorted(ids))); await state.clear(); await m.answer("✅ Admin qo‘shildi.", reply_markup=admin_kb())
+
+@dp.callback_query(F.data == 'admin:remove')
+@admin_required
+async def admin_remove_start(call:CallbackQuery,state:FSMContext):
+    await answer_cb(call); await state.set_state(AdminFSM.admin_remove); await ask_input(call,"Olib tashlanadigan qo‘shimcha admin ID raqamini kiriting:")
+
+@dp.message(AdminFSM.admin_remove)
+@admin_required
+async def admin_remove_save(m:Message,state:FSMContext):
+    ids=set(filter(None,get_setting('extra_admins','').split(','))); ids.discard((m.text or '').strip()); set_setting('extra_admins',','.join(sorted(ids))); await state.clear(); await m.answer("✅ Admin ro‘yxati yangilandi.", reply_markup=admin_kb())
+
+# legacy/admin export commands
+@dp.message(Command('backup'))
+@admin_required
+async def backup_cmd(m:Message): path=make_backup(); await m.answer_document(FSInputFile(path), caption='Backup ZIP')
+@dp.message(Command('export'))
+@admin_required
+async def export_cmd(m:Message): path=export_all_excel(); await m.answer_document(FSInputFile(path), caption='Excel export')
+
+# fallback buttons from old bot
+@dp.message(F.text.in_({'📝 O‘qituvchini baholash','📝 Baholash','🗳 Ovoz berish','Ovoz berish','Baholash'}))
+async def msg_rate(m:Message,state:FSMContext):
+    await state.clear(); ensure_user_obj(m)
+    if not setting_bool('voting_open','1'):
+        return await m.answer('Baholash hozircha yopilgan.')
+    await start_registration(m,state,'rate') if not user_registered(m.from_user.id) else await m.answer(MOTIVATION,reply_markup=deps_kb('rate:dep','home'))
+@dp.message(F.text.in_({'📢 Shikoyat yuborish','📢 Shikoyat','Shikoyat yuborish'}))
+async def msg_complaint(m:Message,state:FSMContext):
+    await state.clear(); ensure_user_obj(m)
+    await start_registration(m,state,'complaint') if not user_registered(m.from_user.id) else await m.answer('Kafedrani tanlang:',reply_markup=deps_kb('complaint:dep','home'))
+
+@dp.message(F.text.in_({'💡 Taklif yuborish','💡 Taklif','Taklif yuborish','Takliflar'}))
+async def msg_suggestion(m:Message,state:FSMContext):
+    await state.clear(); ensure_user_obj(m)
+    if not user_registered(m.from_user.id):
+        return await start_registration(m,state,'suggestion')
+    await state.set_state(SuggestionFSM.text)
+    await ask_input(m, '💡 Taklifingizni yozing:')
+
+
+@dp.message(Command('cancel'))
+async def cancel_cmd(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer('Jarayon bekor qilindi.', reply_markup=ReplyKeyboardRemove())
+    await m.answer(home_text(), reply_markup=main_kb())
+
+@dp.callback_query(F.data == 'admin:settings')
+@admin_required
+async def adm_settings_duplicate_guard(call:CallbackQuery):
+    # This guard is intentionally unreachable if the main settings handler is registered;
+    # kept only for old deployments with partial reloads.
+    await answer_cb(call)
+    await edit_or_send(call,"⚙️ <b>Sozlamalar</b>",admin_settings_kb())
+
+@dp.callback_query(F.data.startswith('admin:'))
+@admin_required
+async def unknown_admin_callback(call: CallbackQuery):
+    await answer_cb(call)
+    await edit_or_send(call, '<b>Admin panel</b>\nBu tugma uchun bo‘lim qayta ochildi.', admin_kb())
+
+@dp.callback_query(F.data.startswith('rate:'))
+async def unknown_rate_callback(call: CallbackQuery):
+    await answer_cb(call)
+    await edit_or_send(call, MOTIVATION, deps_kb('rate:dep','home'))
+
+@dp.errors()
+async def errors_handler(event):
+    log.exception("Update error: %s", event.exception)
     return True
 
-def db_add_teacher(subject_key: str, teacher_key: str, teacher_name: str) -> bool:
-    try:
-        cursor.execute("INSERT INTO db_teachers (teacher_key, subject_key, teacher_name) VALUES (?, ?, ?)",
-                       (teacher_key, subject_key, teacher_name))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+async def daily_backup_job():
+    if setting_bool('daily_backup','1'):
+        try: make_backup(); log.info('Daily backup created')
+        except Exception: log.exception('Daily backup failed')
 
-def db_edit_teacher(subject_key: str, teacher_key: str, new_name: str) -> bool:
-    cursor.execute("UPDATE db_teachers SET teacher_name = ? WHERE subject_key = ? AND teacher_key = ?",
-                   (new_name, subject_key, teacher_key))
-    conn.commit()
-    return cursor.rowcount > 0
-
-def db_delete_teacher(subject_key: str, teacher_key: str) -> bool:
-    cursor.execute("DELETE FROM db_teachers WHERE subject_key = ? AND teacher_key = ?", (subject_key, teacher_key))
-    conn.commit()
-    return cursor.rowcount > 0
-
-def generate_teacher_key(subject_key: str) -> str:
-    prefix = subject_key[:3]
-    cursor.execute("SELECT teacher_key FROM db_teachers WHERE subject_key = ?", (subject_key,))
-    existing = {r[0] for r in cursor.fetchall()}
-    i = 1
-    while f"{prefix}_{i}" in existing:
-        i += 1
-    return f"{prefix}_{i}"
-
-def generate_subject_key(name: str) -> str:
-    import re as _re
-    base = _re.sub(r"[^a-zA-Z0-9]", "", name.lower().replace(" ", "_"))[:8] or "subj"
-    cursor.execute("SELECT subject_key FROM db_subjects")
-    existing = {r[0] for r in cursor.fetchall()}
-    key = base
-    i = 1
-    while key in existing:
-        key = f"{base}{i}"
-        i += 1
-    return key
-
-# =========================
-# ADMIN MANAGE KEYBOARDS
-# =========================
-def admin_manage_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="🏫 Bo'limlarni boshqarish", callback_data="manage_subjects"),
-        InlineKeyboardButton(text="👨‍🏫 O'qituvchilarni boshqarish", callback_data="manage_teachers_select_subject")
-    )
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    return kb.as_markup()
-
-def manage_subjects_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    subjects = get_subjects_from_db()
-    for skey, sdata in subjects.items():
-        kb.row(InlineKeyboardButton(text=f"📂 {sdata['name']}", callback_data=f"manage_subject_actions:{skey}"))
-    kb.row(InlineKeyboardButton(text="➕ Yangi bo'lim qo'shish", callback_data="manage_subject_add"))
-    kb.row(InlineKeyboardButton(text="⬅️ Boshqarish menyusi", callback_data="admin_manage_menu"))
-    return kb.as_markup()
-
-def manage_subject_actions_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data=f"manage_subject_edit:{subject_key}"),
-        InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"manage_subject_delete_confirm:{subject_key}")
-    )
-    kb.row(InlineKeyboardButton(text="⬅️ Bo'limlar", callback_data="manage_subjects"))
-    return kb.as_markup()
-
-def manage_teachers_select_subject_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    subjects = get_subjects_from_db()
-    for skey, sdata in subjects.items():
-        kb.row(InlineKeyboardButton(text=sdata['name'], callback_data=f"manage_teachers:{skey}"))
-    kb.row(InlineKeyboardButton(text="⬅️ Boshqarish menyusi", callback_data="admin_manage_menu"))
-    return kb.as_markup()
-
-def manage_teachers_keyboard(user_id: int, subject_key: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    subjects = get_subjects_from_db()
-    teachers = subjects.get(subject_key, {}).get("teachers", {})
-    for tkey, tname in teachers.items():
-        kb.row(InlineKeyboardButton(text=tname, callback_data=f"manage_teacher_actions:{subject_key}:{tkey}"))
-    kb.row(InlineKeyboardButton(text="➕ Yangi o'qituvchi qo'shish", callback_data=f"manage_teacher_add:{subject_key}"))
-    kb.row(InlineKeyboardButton(text="⬅️ Bo'limlar", callback_data="manage_teachers_select_subject"))
-    return kb.as_markup()
-
-def manage_teacher_actions_keyboard(user_id: int, subject_key: str, teacher_key: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data=f"manage_teacher_edit:{subject_key}:{teacher_key}"),
-        InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"manage_teacher_delete_confirm:{subject_key}:{teacher_key}")
-    )
-    kb.row(InlineKeyboardButton(text="⬅️ O'qituvchilar", callback_data=f"manage_teachers:{subject_key}"))
-    return kb.as_markup()
-
-def manage_cancel_keyboard(user_id: int, back_cb: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text="❌ Bekor qilish", callback_data=back_cb))
-    return kb.as_markup()
-
-def top_votes_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="👨‍🏫 O'qituvchilar TOP 10", callback_data="admin_top_votes"),
-        InlineKeyboardButton(text="🏫 Bo'limlar TOP 10", callback_data="admin_top_votes_by_subject")
-    )
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    return kb.as_markup()
-
-
-# =========================
-# ADMIN TOP VOTES MENU CALLBACKS
-# =========================
-@dp.callback_query(F.data == "admin_top_votes_menu")
-async def admin_top_votes_menu_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    await safe_edit_message(callback, "🥇 <b>TOP 10 ovoz bo'yicha</b>\n\nQaysi ko'rinishda ko'rmoqchisiz?", top_votes_menu_keyboard(user_id))
-    await callback.answer()
-
-@dp.callback_query(F.data == "admin_top_votes_by_subject")
-async def admin_top_votes_by_subject_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text=tr(user_id, "🔄 Yangilash"), callback_data="admin_top_votes_by_subject"))
-    kb.row(InlineKeyboardButton(text="⬅️ TOP menyusi", callback_data="admin_top_votes_menu"))
-    kb.row(InlineKeyboardButton(text="⬅️ Admin panel", callback_data="back_admin_panel"))
-    async with db_lock:
-        text = add_refresh_time(get_top_votes_by_subject_text(user_id), user_id)
-    await safe_edit_message(callback, text, kb.as_markup())
-    await callback.answer()
-
-
-# =========================
-# ADMIN MANAGE CALLBACKS
-# =========================
-@dp.callback_query(F.data == "admin_manage_menu")
-async def admin_manage_menu_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    await safe_edit_message(callback, "⚙️ <b>Boshqarish menyusi</b>\n\nNimani boshqarmoqchisiz?", admin_manage_menu_keyboard(user_id))
-    await callback.answer()
-
-@dp.callback_query(F.data == "manage_subjects")
-async def manage_subjects_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    subjects = get_subjects_from_db()
-    text = f"🏫 <b>Bo'limlar ro'yxati</b>\n\nJami: {len(subjects)} ta bo'lim"
-    await safe_edit_message(callback, text, manage_subjects_keyboard(user_id))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("manage_subject_actions:"))
-async def manage_subject_actions_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    subject_key = callback.data.split(":", 1)[1]
-    sname = get_subject_name(subject_key)
-    subjects = get_subjects_from_db()
-    teacher_count = len(subjects.get(subject_key, {}).get("teachers", {}))
-    text = f"📂 <b>{sname}</b>\n\nO'qituvchilar soni: {teacher_count}\n\nNimani qilmoqchisiz?"
-    await safe_edit_message(callback, text, manage_subject_actions_keyboard(user_id, subject_key))
-    await callback.answer()
-
-@dp.callback_query(F.data == "manage_subject_add")
-async def manage_subject_add_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    ADMIN_MANAGE_STATE[user_id] = {"action": "add_subject"}
-    await safe_edit_message(callback,
-        "➕ <b>Yangi bo'lim qo'shish</b>\n\nBo'lim nomini yozing (masalan: Tarix fanlari):",
-        manage_cancel_keyboard(user_id, "manage_subjects"))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("manage_subject_edit:"))
-async def manage_subject_edit_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    subject_key = callback.data.split(":", 1)[1]
-    sname = get_subject_name(subject_key)
-    ADMIN_MANAGE_STATE[user_id] = {"action": "edit_subject", "subject_key": subject_key}
-    await safe_edit_message(callback,
-        f"✏️ <b>Bo'lim nomini o'zgartirish</b>\n\nHozirgi nom: <b>{sname}</b>\n\nYangi nomni yozing:",
-        manage_cancel_keyboard(user_id, f"manage_subject_actions:{subject_key}"))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("manage_subject_delete_confirm:"))
-async def manage_subject_delete_confirm_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    subject_key = callback.data.split(":", 1)[1]
-    sname = get_subject_name(subject_key)
-    subjects = get_subjects_from_db()
-    teacher_count = len(subjects.get(subject_key, {}).get("teachers", {}))
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"manage_subject_actions:{subject_key}"),
-        InlineKeyboardButton(text="✅ Ha, o'chirish", callback_data=f"manage_subject_delete:{subject_key}")
-    )
-    await safe_edit_message(callback,
-        f"⚠️ <b>Diqqat!</b>\n\n<b>{sname}</b> bo'limi va unga tegishli <b>{teacher_count} ta o'qituvchi</b> o'chiriladi!\n\nDavom etasizmi?",
-        kb.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("manage_subject_delete:"))
-async def manage_subject_delete_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    subject_key = callback.data.split(":", 1)[1]
-    sname = get_subject_name(subject_key)
-    async with db_lock:
-        db_delete_subject(subject_key)
-    subjects = get_subjects_from_db()
-    text = f"✅ <b>{sname}</b> bo'limi o'chirildi.\n\nJami: {len(subjects)} ta bo'lim"
-    await safe_edit_message(callback, text, manage_subjects_keyboard(user_id))
-    await callback.answer("O'chirildi!")
-
-@dp.callback_query(F.data == "manage_teachers_select_subject")
-async def manage_teachers_select_subject_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    await safe_edit_message(callback, "👨‍🏫 <b>O'qituvchilarni boshqarish</b>\n\nBo'limni tanlang:", manage_teachers_select_subject_keyboard(user_id))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("manage_teachers:"))
-async def manage_teachers_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    subject_key = callback.data.split(":", 1)[1]
-    sname = get_subject_name(subject_key)
-    subjects = get_subjects_from_db()
-    teacher_count = len(subjects.get(subject_key, {}).get("teachers", {}))
-    text = f"👨‍🏫 <b>{sname}</b>\n\nO'qituvchilar soni: {teacher_count}\n\nO'qituvchini tanlang:"
-    await safe_edit_message(callback, text, manage_teachers_keyboard(user_id, subject_key))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("manage_teacher_actions:"))
-async def manage_teacher_actions_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer("Xato", show_alert=True)
-        return
-    _, subject_key, teacher_key = parts
-    tname = get_teacher_name(subject_key, teacher_key)
-    sname = get_subject_name(subject_key)
-    text = f"👤 <b>{tname}</b>\n📂 {sname}\n\nNimani qilmoqchisiz?"
-    await safe_edit_message(callback, text, manage_teacher_actions_keyboard(user_id, subject_key, teacher_key))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("manage_teacher_add:"))
-async def manage_teacher_add_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    subject_key = callback.data.split(":", 1)[1]
-    sname = get_subject_name(subject_key)
-    ADMIN_MANAGE_STATE[user_id] = {"action": "add_teacher", "subject_key": subject_key}
-    await safe_edit_message(callback,
-        f"➕ <b>Yangi o'qituvchi qo'shish</b>\n📂 Bo'lim: <b>{sname}</b>\n\nO'qituvchi to'liq ismini yozing (F.I.Sh):",
-        manage_cancel_keyboard(user_id, f"manage_teachers:{subject_key}"))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("manage_teacher_edit:"))
-async def manage_teacher_edit_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer("Xato", show_alert=True)
-        return
-    _, subject_key, teacher_key = parts
-    tname = get_teacher_name(subject_key, teacher_key)
-    ADMIN_MANAGE_STATE[user_id] = {"action": "edit_teacher", "subject_key": subject_key, "teacher_key": teacher_key}
-    await safe_edit_message(callback,
-        f"✏️ <b>O'qituvchi nomini o'zgartirish</b>\n\nHozirgi ism: <b>{tname}</b>\n\nYangi to'liq ismni yozing:",
-        manage_cancel_keyboard(user_id, f"manage_teacher_actions:{subject_key}:{teacher_key}"))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("manage_teacher_delete_confirm:"))
-async def manage_teacher_delete_confirm_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer("Xato", show_alert=True)
-        return
-    _, subject_key, teacher_key = parts
-    tname = get_teacher_name(subject_key, teacher_key)
-    kb = InlineKeyboardBuilder()
-    kb.row(
-        InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"manage_teacher_actions:{subject_key}:{teacher_key}"),
-        InlineKeyboardButton(text="✅ Ha, o'chirish", callback_data=f"manage_teacher_delete:{subject_key}:{teacher_key}")
-    )
-    await safe_edit_message(callback,
-        f"⚠️ <b>Diqqat!</b>\n\n<b>{tname}</b> o'chiriladi!\n\nDavom etasizmi?",
-        kb.as_markup())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("manage_teacher_delete:"))
-async def manage_teacher_delete_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Siz admin emassiz.", show_alert=True)
-        return
-    parts = callback.data.split(":")
-    if len(parts) != 3:
-        await callback.answer("Xato", show_alert=True)
-        return
-    _, subject_key, teacher_key = parts
-    tname = get_teacher_name(subject_key, teacher_key)
-    async with db_lock:
-        db_delete_teacher(subject_key, teacher_key)
-    await safe_edit_message(callback,
-        f"✅ <b>{tname}</b> o'chirildi.",
-        manage_teachers_keyboard(user_id, subject_key))
-    await callback.answer("O'chirildi!")
-
-
-# TEXT HANDLER
-# =========================
-@dp.message(F.text)
-async def text_handler(message: Message):
-    user_id = message.from_user.id
-    ensure_user(user_id)
-
-    # Admin boshqarish holati
-    if is_admin(user_id) and user_id in ADMIN_MANAGE_STATE:
-        state = ADMIN_MANAGE_STATE.pop(user_id)
-        text = (message.text or "").strip()
-        action = state.get("action")
-
-        if action == "add_subject":
-            if not text:
-                await message.answer("Bo'sh nom kiritilmadi.")
-                return
-            skey = generate_subject_key(text)
-            async with db_lock:
-                ok = db_add_subject(skey, text)
-            if ok:
-                await message.answer(
-                    f"✅ <b>{text}</b> bo'limi qo'shildi!", parse_mode="HTML",
-                    reply_markup=manage_subjects_keyboard(user_id)
-                )
-            else:
-                await message.answer("❌ Xatolik: bunday kalit allaqachon mavjud.",
-                    reply_markup=manage_subjects_keyboard(user_id))
-            return
-
-        elif action == "edit_subject":
-            subject_key = state.get("subject_key")
-            if not text:
-                await message.answer("Bo'sh nom kiritilmadi.")
-                return
-            async with db_lock:
-                db_edit_subject(subject_key, text)
-            await message.answer(
-                f"✅ Bo'lim nomi <b>{text}</b> ga o'zgartirildi!", parse_mode="HTML",
-                reply_markup=manage_subjects_keyboard(user_id)
-            )
-            return
-
-        elif action == "add_teacher":
-            subject_key = state.get("subject_key")
-            if not text:
-                await message.answer("Bo'sh ism kiritilmadi.")
-                return
-            tkey = generate_teacher_key(subject_key)
-            async with db_lock:
-                db_add_teacher(subject_key, tkey, text)
-            await message.answer(
-                f"✅ <b>{text}</b> o'qituvchi sifatida qo'shildi!", parse_mode="HTML",
-                reply_markup=manage_teachers_keyboard(user_id, subject_key)
-            )
-            return
-
-        elif action == "edit_teacher":
-            subject_key = state.get("subject_key")
-            teacher_key = state.get("teacher_key")
-            if not text:
-                await message.answer("Bo'sh ism kiritilmadi.")
-                return
-            async with db_lock:
-                db_edit_teacher(subject_key, teacher_key, text)
-            await message.answer(
-                f"✅ O'qituvchi ismi <b>{text}</b> ga o'zgartirildi!", parse_mode="HTML",
-                reply_markup=manage_teachers_keyboard(user_id, subject_key)
-            )
-            return
-
-    if user_id in WAITING_COMPLAINT_TEXT:
-        text = (message.text or "").strip()
-        if not text:
-            await message.answer("Bo'sh xabar qabul qilinmaydi. Iltimos, matn yozing.")
-            return
-
-        allowed, reason = complaint_allowed(user_id, text)
-        if not allowed:
-            await message.answer(tr(user_id, reason), parse_mode="HTML", reply_markup=complaint_cancel_keyboard(user_id))
-            return
-
-        WAITING_COMPLAINT_TEXT.discard(user_id)
-        async with db_lock:
-            save_complaint(
-                user_id=user_id,
-                full_name=message.from_user.full_name or "Noma'lum",
-                username=message.from_user.username or "",
-                message_text=text,
-            )
-        await message.answer(
-            get_complaint_saved_text(user_id),
-            parse_mode="HTML",
-            reply_markup=home_keyboard(user_id)
-        )
-        return
-
-    if message.text and message.text.lower() == "results":
-        await message.answer(
-            get_results_menu_text(user_id, False),
-            parse_mode="HTML",
-            reply_markup=results_menu_keyboard_user(user_id)
-        )
-
-
-# =========================
-# MAIN
-# =========================
 async def main():
     init_db()
-    logging.info(f"Bot ishga tushdi. Baza: {DB_NAME}")
-    await dp.start_polling(bot)
+    if AsyncIOScheduler:
+        scheduler=AsyncIOScheduler(timezone='Asia/Tashkent')
+        scheduler.add_job(daily_backup_job, 'cron', hour=3, minute=0)
+        scheduler.start()
+    log.info('Bot started')
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
-
