@@ -341,7 +341,7 @@ def department_stats(dkey:str):
 def ik(rows: list[list[tuple[str,str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t,d in row] for row in rows])
 def main_kb(): return ik([[('📝 Baholash','rate:start')],[('📢 Shikoyat','complaint:start'),('💡 Taklif','suggestion:start')],[('🏆 Reyting','rating:top'),('ℹ️ Ma’lumot','info')]])
-def admin_kb(): return ik([[('📊 Dashboard','admin:dash')],[('👨‍🏫 O‘qituvchilar','admin:teachers'),('⭐ Statistika','admin:tstats')],[('🏛 Kafedralar','admin:dept_rating'),('📢 Shikoyatlar','admin:complaints')],[('💡 Takliflar','admin:suggestions'),('📁 Export / Backup','admin:export')],[('⚙️ Sozlamalar','admin:settings'),('🏠 User menyu','home')]])
+def admin_kb(): return ik([[('📊 Dashboard','admin:dash')],[('👨‍🏫 O‘qituvchilar','admin:teachers'),('🏆 Reyting','admin:rating')],[('📢 Shikoyatlar','admin:complaints'),('💡 Takliflar','admin:suggestions')],[('📁 Export / Backup','admin:export'),('⚙️ Sozlamalar','admin:settings')]])
 def deps_kb(prefix:str, back='home'):
     rows=[[ (d['name'][:40], f'{prefix}:{d["department_key"]}') ] for d in departments()]
     rows.append([('⬅️ Orqaga',back)]); return ik(rows)
@@ -387,6 +387,42 @@ def departments_rating_text():
         lines.append(f"{i}. <b>{safe(d['name'])}</b>\nO‘qituvchi: {st['teachers']} • Baholar: {st['votes']}\nO‘rtacha: {st['avg']:.2f} • Qatnashuv: {st['participation']:.1f}%\nFinal score: <b>{st['final']:.3f}</b>")
     return '\n\n'.join(lines)
 
+
+
+def teacher_ranking_rows(limit: int | None = None):
+    data=[]
+    for t in all_teachers():
+        st=teacher_stats(t['department_key'],t['teacher_key'])
+        data.append((st['final'], st['avg'], st['total'], t, st))
+    data.sort(key=lambda x:(x[0], x[2], x[1]), reverse=True)
+    return data[:limit] if limit else data
+
+def department_ranking_rows():
+    data=[]
+    for d in departments():
+        st=department_stats(d['department_key'])
+        data.append((st['final'], d, st))
+    data.sort(key=lambda x:x[0], reverse=True)
+    return data
+
+def admin_teacher_top10_text():
+    rows=teacher_ranking_rows(10)
+    lines=["🏆 <b>TOP 10 o‘qituvchilar reytingi</b>\n"]
+    if not rows:
+        return "🏆 <b>TOP 10 o‘qituvchilar reytingi</b>\n\nHozircha ma’lumot yo‘q."
+    for i,(final,avg,total,t,st) in enumerate(rows,1):
+        lines.append(f"{i}. <b>{safe(t['name'])}</b>\n{safe(t['department_name'])}\n⭐ {avg:.2f} • {total} baho • Qatnashuv: {st['participation']:.1f}% • score: <b>{final:.3f}</b>")
+    return '\n\n'.join(lines)
+
+def admin_department_rating_text():
+    rows=department_ranking_rows()
+    lines=["🏛 <b>Kafedralar reytingi</b>\n<em>Hisob: kafedradagi o‘qituvchilar final score o‘rta arifmetigi.</em>\n"]
+    if not rows:
+        return "🏛 <b>Kafedralar reytingi</b>\n\nHozircha ma’lumot yo‘q."
+    for i,(score,d,st) in enumerate(rows,1):
+        lines.append(f"{i}. <b>{safe(d['name'])}</b>\nO‘qituvchilar: {st['teachers']} • Jami baholar: {st['votes']}\nO‘rtacha baho: {st['avg']:.2f} • Qatnashuv: {st['participation']:.1f}%\nFinal: <b>{st['final']:.3f}</b>")
+    return '\n\n'.join(lines)
+
 # =====================================================
 # EXPORT / BACKUP
 # =====================================================
@@ -421,7 +457,36 @@ def export_all_excel() -> Path:
         st=teacher_stats(t['department_key'],t['teacher_key'])
         ws.append([dep_name(t['department_key']),t['name'],round(st['avg'],2),st['total'],st['student_count'],round(st['participation'],2),round(st['final'],4),st['dist'][1],st['dist'][2],st['dist'][3],st['dist'][4],st['dist'][5]])
     style_ws(ws)
+    ws=wb.create_sheet("Teacher Ranking"); ws.append(["O‘rin","Kafedra","O‘qituvchi","Average","Votes","Students","Participation %","Final score"])
+    for i,(final,avg,total,t,st) in enumerate(teacher_ranking_rows(),1):
+        ws.append([i, dep_name(t['department_key']), t['name'], round(avg,2), total, st['student_count'], round(st['participation'],2), round(final,4)])
+    style_ws(ws)
+    ws=wb.create_sheet("Department Ranking"); ws.append(["O‘rin","Kafedra","Teachers","Votes","Average","Participation %","Final department score"])
+    for i,(score,d,st) in enumerate(department_ranking_rows(),1):
+        ws.append([i, d['name'], st['teachers'], st['votes'], round(st['avg'],2), round(st['participation'],2), round(score,4)])
+    style_ws(ws)
     path=DATA_DIR/f"full_export_{datetime.now(UZ_TZ).strftime('%Y%m%d_%H%M%S')}.xlsx"; wb.save(path); return path
+
+def export_teacher_ranking_excel() -> Path:
+    if Workbook is None:
+        path=DATA_DIR/"teacher_ranking.csv"; return path
+    wb=Workbook(); ws=wb.active; ws.title="Top Teachers"
+    ws.append(["O‘rin","Kafedra","O‘qituvchi","Average","Votes","Students","Participation %","Final score"])
+    for i,(final,avg,total,t,st) in enumerate(teacher_ranking_rows(10),1):
+        ws.append([i, dep_name(t['department_key']), t['name'], round(avg,2), total, st['student_count'], round(st['participation'],2), round(final,4)])
+    style_ws(ws)
+    path=DATA_DIR/f"teacher_top10_{datetime.now(UZ_TZ).strftime('%Y%m%d_%H%M%S')}.xlsx"; wb.save(path); return path
+
+def export_department_ranking_excel() -> Path:
+    if Workbook is None:
+        path=DATA_DIR/"department_ranking.csv"; return path
+    wb=Workbook(); ws=wb.active; ws.title="Department Ranking"
+    ws.append(["O‘rin","Kafedra","Teachers","Votes","Average","Participation %","Final department score"])
+    for i,(score,d,st) in enumerate(department_ranking_rows(),1):
+        ws.append([i, d['name'], st['teachers'], st['votes'], round(st['avg'],2), round(st['participation'],2), round(score,4)])
+    style_ws(ws)
+    path=DATA_DIR/f"department_ranking_{datetime.now(UZ_TZ).strftime('%Y%m%d_%H%M%S')}.xlsx"; wb.save(path); return path
+
 
 def make_backup() -> Path:
     import zipfile
@@ -476,16 +541,54 @@ async def info_cb(call:CallbackQuery): await answer_cb(call); await edit_or_send
 
 @dp.message(StateFilter('*'), F.text == '❌ Bekor qilish')
 async def cancel_button(m: Message, state: FSMContext):
+    current = await state.get_state()
+    data = await state.get_data()
+    await m.answer('⬅️ Bir qadam orqaga qaytildi.', reply_markup=ReplyKeyboardRemove())
+    if current == Register.phone.state:
+        await state.set_state(Register.last_name)
+        return await ask_input(m, 'Familiyangizni qaytadan kiriting:')
+    if current == Register.last_name.state:
+        await state.set_state(Register.first_name)
+        return await ask_input(m, 'Ismingizni qaytadan kiriting:')
+    if current == Register.first_name.state:
+        await state.clear()
+        return await m.answer(home_text(), reply_markup=main_kb())
+    if current == ComplaintFSM.text.state:
+        dkey=data.get('dkey')
+        await state.set_state(ComplaintFSM.teacher)
+        return await m.answer('O‘qituvchini tanlang:', reply_markup=teachers_kb(dkey,'complaint:teacher','complaint:start') if dkey else deps_kb('complaint:dep','home'))
+    if current == SuggestionFSM.text.state:
+        await state.clear()
+        return await m.answer(home_text(), reply_markup=main_kb())
+    if current == TeacherFSM.add_name.state:
+        await state.set_state(TeacherFSM.add_department)
+        return await m.answer('Qaysi kafedraga qo‘shiladi?', reply_markup=deps_kb('tm:adddep','admin:teachers'))
+    if current == TeacherFSM.student_count.state:
+        dkey=data.get('dkey'); tkey=data.get('tkey')
+        await state.clear()
+        if dkey and tkey:
+            return await m.answer(teacher_stats_text(dkey,tkey), reply_markup=ik([[('⬅️ O‘qituvchilar',f'tm:listdep:{dkey}')],[('⬅️ Admin','admin:menu')]]))
+        return await m.answer('👨‍🏫 <b>O‘qituvchilar</b>', reply_markup=admin_teachers_kb())
+    if current == TeacherFSM.search.state:
+        await state.clear()
+        return await m.answer('👨‍🏫 <b>O‘qituvchilar</b>', reply_markup=admin_teachers_kb())
+    if current in (TeacherEditFSM.name.state, TeacherEditFSM.student_count.state):
+        dkey=data.get('dkey'); tkey=data.get('tkey')
+        await state.clear()
+        if dkey and tkey:
+            return await m.answer(teacher_stats_text(dkey,tkey), reply_markup=ik([[('✏️ Ism',f'tm:editname:{dkey}:{tkey}'),('👥 O‘quvchi',f'tm:editstudents:{dkey}:{tkey}')],[('⬅️ Ro‘yxat',f'tm:listdep:{dkey}')]]))
+        return await m.answer('👨‍🏫 <b>O‘qituvchilar</b>', reply_markup=admin_teachers_kb())
+    if current in (DepartmentFSM.add_name.state, DepartmentFSM.edit_name.state, DepartmentFSM.sort_order.state):
+        await state.clear()
+        return await m.answer('🏛 <b>Kafedralar boshqaruvi</b>', reply_markup=ik([[('➕ Qo‘shish','dep:add'),('📋 Ro‘yxat','dep:list')],[('⬅️ Admin','admin:menu')]]))
+    if current in (AdminFSM.admin_add.state, AdminFSM.admin_remove.state):
+        await state.clear()
+        return await m.answer('🔐 Adminlar sozlamasi', reply_markup=ik([[('➕ Admin qo‘shish','admin:add'),('➖ Admin olish','admin:remove')],[('⬅️ Sozlamalar','admin:settings')]]))
     await state.clear()
-    await m.answer('Jarayon bekor qilindi.', reply_markup=ReplyKeyboardRemove())
     if is_admin(m.from_user.id):
         await m.answer('<b>Admin panel</b>', reply_markup=admin_kb())
     else:
         await m.answer(home_text(), reply_markup=main_kb())
-
-async def start_registration(target, state:FSMContext, after:str):
-    await state.set_state(Register.first_name); await state.update_data(after=after)
-    await ask_input(target, "Baholashdan oldin ro‘yxatdan o‘ting.\n\nIsmingizni kiriting:")
 
 @dp.message(Register.first_name)
 async def reg_first(m:Message,state:FSMContext):
@@ -904,6 +1007,38 @@ async def suggestion_status(call:CallbackQuery):
     conn.execute("UPDATE suggestions SET status=? WHERE id=?",(status_map.get(status,'Yangi'),sid)); conn.commit()
     await edit_or_send(call,"✅ Taklif statusi yangilandi.",ik([[('💡 Takliflar','admin:suggestions')],[('⬅️ Admin','admin:menu')]]))
 
+@dp.callback_query(F.data == 'admin:rating')
+@admin_required
+async def admin_rating_menu(call:CallbackQuery):
+    await answer_cb(call)
+    await edit_or_send(call, "🏆 <b>Reyting</b>\nKerakli reyting turini tanlang:", ik([[('👨‍🏫 O‘qituvchilar','admin:rating:teachers'),('🏛 Kafedralar','admin:rating:departments')],[('⬅️ Admin','admin:menu')]]))
+
+@dp.callback_query(F.data == 'admin:rating:teachers')
+@admin_required
+async def admin_rating_teachers(call:CallbackQuery):
+    await answer_cb(call)
+    await edit_or_send(call, admin_teacher_top10_text(), ik([[('📥 Excel export','export:rating_teachers')],[('⬅️ Reyting','admin:rating')]]))
+
+@dp.callback_query(F.data == 'admin:rating:departments')
+@admin_required
+async def admin_rating_departments(call:CallbackQuery):
+    await answer_cb(call)
+    await edit_or_send(call, admin_department_rating_text(), ik([[('📥 Excel export','export:rating_departments')],[('⬅️ Reyting','admin:rating')]]))
+
+@dp.callback_query(F.data == 'export:rating_teachers')
+@admin_required
+async def export_rating_teachers_cb(call:CallbackQuery):
+    await answer_cb(call,'Tayyorlanmoqda...')
+    path=export_teacher_ranking_excel()
+    await call.message.answer_document(FSInputFile(path), caption='TOP 10 o‘qituvchilar reytingi Excel tayyor.')
+
+@dp.callback_query(F.data == 'export:rating_departments')
+@admin_required
+async def export_rating_departments_cb(call:CallbackQuery):
+    await answer_cb(call,'Tayyorlanmoqda...')
+    path=export_department_ranking_excel()
+    await call.message.answer_document(FSInputFile(path), caption='Kafedralar reytingi Excel tayyor.')
+
 @dp.callback_query(F.data == 'admin:export')
 @admin_required
 async def adm_export(call:CallbackQuery): await answer_cb(call); await edit_or_send(call,"📁 <b>Export / Backup</b>",ik([[('Excel export','export:excel'),('Backup ZIP','export:backup')],[('⬅️ Admin','admin:menu')]]))
@@ -934,7 +1069,7 @@ async def set_complaints(call:CallbackQuery): await adm_complaints(call)
 @dp.callback_query(F.data == 'set:rating')
 @admin_required
 async def set_rating(call:CallbackQuery):
-    await answer_cb(call); await edit_or_send(call,departments_rating_text(),ik([[('⬅️ Sozlamalar','admin:settings')]]))
+    await admin_rating_menu(call)
 
 @dp.callback_query(F.data == 'set:backup')
 @admin_required
