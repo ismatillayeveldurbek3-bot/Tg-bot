@@ -1,21 +1,12 @@
-# Fixed v4 - user request patch
+# FIXES V5
 
-Ushbu versiya `Tg-bot-main-fixed-v3` ustiga qo'shimcha tuzatishlar bilan tayyorlandi.
+Ushbu versiyada quyidagilar tuzatildi:
 
-## Qo'shilgan va tuzatilganlar
-
-- Ma'lumot kiritish talab qilingan flowlarda `❌ Bekor qilish` tugmasi qo'shildi.
-- Telefon contact so'ralganda ham `❌ Bekor qilish` mavjud.
-- Shikoyat matni yuborilgandan keyin bot qotib qolmasligi uchun FSM to'liq tozalanadi va foydalanuvchiga bosh menyu qaytariladi.
-- Shikoyat/taklif admin xabarnomalari asosiy user flowini to'sib qo'ymasligi uchun xavfsiz background task orqali yuboriladi.
-- `suggestions` jadvali qo'shildi.
-- User menyuga `💡 Taklif` bo'limi qo'shildi.
-- Admin panelga `💡 Takliflar` bo'limi qo'shildi.
-- Admin takliflarni ko'rishi va statusini `Yangi`, `Ko'rib chiqilmoqda`, `Yopilgan` qilib o'zgartirishi mumkin.
-- Dashboardda takliflar soni ko'rsatiladi.
-- Excel exportga `Suggestions` sheet qo'shildi.
-- Backup ZIP ichidagi Excel exportda takliflar ham bo'ladi.
-
-## Tekshirilgan
-
-- `python3 -m py_compile main.py` sintaksis tekshiruvidan o'tdi.
+- ⚙️ Sozlamalar ichidan “👨‍🏫 O‘qituvchilar” oynasi olib tashlandi.
+- Shikoyat yozish flowi qayta tekshirildi va mustahkamlandi.
+- Eski database’da `complaints` jadvalida yetishmaydigan ustunlar bo‘lsa, migration avtomatik qo‘shadi.
+- Shikoyat matni saqlanishida xatolik bo‘lsa, bot qotmaydi; foydalanuvchiga xabar va bosh menyu qaytariladi.
+- Shikoyat yuborilgandan keyin admin xabarnomasi alohida async task orqali yuboriladi.
+- Input talab qilinadigan joylarda `❌ Bekor qilish` tugmasi saqlab qolindi va ayrim validatsiya xabarlariga ham qo‘shildi.
+- Ba’zi ishlamay qolishi mumkin bo‘lgan sozlamalar callbacklari uchun fallback qo‘shildi.
+- `python -m py_compile main.py` bilan sintaksis tekshirildi.
