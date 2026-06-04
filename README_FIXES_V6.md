@@ -1,13 +1,12 @@
-# FIXES V6
+# FIXES V5
 
-Ushbu versiya fixed-v5 ustiga quyidagi o‘zgarishlarni kiritadi:
+Ushbu versiyada quyidagilar tuzatildi:
 
-- Admin panel asosiy menyusidan `⭐ Statistika`, `🏛 Kafedralar` va `🏠 User menyu` tugmalari olib tashlandi.
-- Admin panelga yangi `🏆 Reyting` bo‘limi qo‘shildi.
-- Reyting bo‘limida:
-  - `👨‍🏫 O‘qituvchilar` — TOP 10 eng yuqori final score olgan o‘qituvchilar.
-  - `🏛 Kafedralar` — kafedradagi o‘qituvchilar final score o‘rta arifmetigi orqali reyting.
-  - Har ikki reyting uchun alohida Excel export tugmasi qo‘shildi.
-- Umumiy Excel export va backup ichiga `Teacher Ranking` hamda `Department Ranking` varaqlari qo‘shildi.
-- `❌ Bekor qilish` tugmasi global reset emas, imkon qadar bir qadam orqaga qaytaradigan qilindi.
-- Sintaksis `python3 -m py_compile main.py` orqali tekshirildi.
+- ⚙️ Sozlamalar ichidan “👨‍🏫 O‘qituvchilar” oynasi olib tashlandi.
+- Shikoyat yozish flowi qayta tekshirildi va mustahkamlandi.
+- Eski database’da `complaints` jadvalida yetishmaydigan ustunlar bo‘lsa, migration avtomatik qo‘shadi.
+- Shikoyat matni saqlanishida xatolik bo‘lsa, bot qotmaydi; foydalanuvchiga xabar va bosh menyu qaytariladi.
+- Shikoyat yuborilgandan keyin admin xabarnomasi alohida async task orqali yuboriladi.
+- Input talab qilinadigan joylarda `❌ Bekor qilish` tugmasi saqlab qolindi va ayrim validatsiya xabarlariga ham qo‘shildi.
+- Ba’zi ishlamay qolishi mumkin bo‘lgan sozlamalar callbacklari uchun fallback qo‘shildi.
+- `python -m py_compile main.py` bilan sintaksis tekshirildi.
