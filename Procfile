@@ -1,11 +1,1 @@
-[variables]
-MISE_PYTHON_GITHUB_ATTESTATIONS = "false"
-
-[phases.setup]
-nixPkgs = ["python311"]
-
-[phases.install]
-cmds = ["pip install -r requirements.txt"]
-
-[start]
-cmd = "python main.py"
+worker: python main.py
