@@ -655,31 +655,62 @@ async def reg_phone(m:Message,state:FSMContext):
 async def rate_start(call:CallbackQuery,state:FSMContext):
     await answer_cb(call)
     await state.clear()
+    if not setting_bool('voting_open','1'):
+        return await call.answer("❌ Baholash hozircha yopilgan. Keyinroq urinib ko‘ring.", show_alert=True)
     if not await check_sub(call.from_user.id):
-        return await call.answer('Avval kanalga obuna bo‘ling.', show_alert=True)
-    if not setting_bool('voting_open','1'): return await call.answer('Baholash hozircha yopilgan.', show_alert=True)
-    if not user_registered(call.from_user.id): return await start_registration(call,state,'rate')
+        kb=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='📢 Telegram kanal', url=CHANNEL_URL)],
+            [InlineKeyboardButton(text='✅ Obunani tekshirish', callback_data='check_sub')]
+        ])
+        return await edit_or_send(call, "⚠️ Baholash uchun avval Telegram kanalimizga obuna bo‘ling.", kb)
+    if not user_registered(call.from_user.id):
+        return await start_registration(call,state,'rate')
     await edit_or_send(call, MOTIVATION, deps_kb('rate:dep','home'))
+
 @dp.callback_query(F.data.startswith('rate:dep:'))
 async def rate_dep(call:CallbackQuery):
-    await answer_cb(call); dkey=call.data.split(':',2)[2]
+    await answer_cb(call)
+    if not setting_bool('voting_open','1'):
+        return await call.answer("❌ Baholash hozircha yopilgan.", show_alert=True)
+    dkey=call.data.split(':',2)[2]
+    if not dkey or not dep_name(dkey):
+        return await call.answer('Kafedra topilmadi.', show_alert=True)
     await edit_or_send(call, f"<b>{safe(dep_name(dkey))}</b>\nO‘qituvchini tanlang:", teachers_kb(dkey,'rate:teacher','rate:start'))
+
 @dp.callback_query(F.data.startswith('rate:teacher:'))
 async def rate_teacher(call:CallbackQuery):
-    await answer_cb(call); _,_,dkey,tkey=call.data.split(':',3)
+    await answer_cb(call)
+    if not setting_bool('voting_open','1'):
+        return await call.answer("❌ Baholash hozircha yopilgan.", show_alert=True)
+    parts=call.data.split(':',3)
+    if len(parts)<4:
+        return await call.answer('Xatolik yuz berdi.', show_alert=True)
+    _,_,dkey,tkey=parts
     old=conn.execute("SELECT rating FROM ratings WHERE user_id=? AND department_key=? AND teacher_key=?",(call.from_user.id,dkey,tkey)).fetchone()
     if old:
         return await edit_or_send(call, f"<b>{safe(teacher_name(dkey,tkey))}</b>\n\nSiz bu o‘qituvchini avval baholagansiz: <b>{old[0]}⭐</b>", ik([[('⬅️ O‘qituvchilar',f'rate:dep:{dkey}')],[('🏠 Menyu','home')]]))
-    txt=f"<b>{safe(teacher_name(dkey,tkey))}</b>\n\nBahoni tanlang."
+    txt=f"<b>{safe(teacher_name(dkey,tkey))}</b>\n\nBahoni tanlang (1 — past, 5 — yuksak):"
     await edit_or_send(call, txt, rating_stars_kb(dkey,tkey))
+
 @dp.callback_query(F.data.startswith('rate:save:'))
 async def rate_save(call:CallbackQuery):
-    await answer_cb(call); _,_,dkey,tkey,val=call.data.split(':',4)
-    if not user_registered(call.from_user.id): return await call.answer('Avval ro‘yxatdan o‘ting.', show_alert=True)
-    ok = save_rating(call.from_user.id,dkey,tkey,int(val))
+    await answer_cb(call)
+    if not setting_bool('voting_open','1'):
+        return await call.answer("❌ Baholash hozircha yopilgan.", show_alert=True)
+    parts=call.data.split(':',4)
+    if len(parts)<5:
+        return await call.answer('Xatolik yuz berdi.', show_alert=True)
+    _,_,dkey,tkey,val=parts
+    if not user_registered(call.from_user.id):
+        return await call.answer("Avval ro‘yxatdan o‘ting.", show_alert=True)
+    try:
+        ok = save_rating(call.from_user.id,dkey,tkey,int(val))
+    except Exception:
+        log.exception("rate_save error")
+        return await call.answer("Saqlashda xatolik. Qayta urinib ko‘ring.", show_alert=True)
     if not ok:
-        return await call.answer('Siz bu o‘qituvchini avval baholagansiz.', show_alert=True)
-    await edit_or_send(call, f"✅ Baho saqlandi: <b>{val}⭐</b>\n\n{safe(teacher_name(dkey,tkey))}", ik([[('Yana baholash','rate:start'),('🏆 Reyting','rating:top')],[('🏠 Menyu','home')]]))
+        return await call.answer("⚠️ Siz bu o‘qituvchini avval baholagansiz.", show_alert=True)
+    await edit_or_send(call, f"✅ Baho saqlandi: <b>{val}⭐</b>\n\n<b>{safe(teacher_name(dkey,tkey))}</b>", ik([[('📝 Yana baholash','rate:start'),('🏆 Reyting','rating:top')],[('🏠 Menyu','home')]]))
 
 @dp.callback_query(F.data == 'rating:top')
 async def rating_top(call:CallbackQuery): await answer_cb(call); await edit_or_send(call, top_rating_text(), ik([[('🏛 Kafedralar','dept_rating:public')],[('⬅️ Orqaga','home')]]))
@@ -788,9 +819,11 @@ async def admin_menu(call:CallbackQuery): await answer_cb(call); await edit_or_s
 async def admin_dash(call:CallbackQuery):
     await answer_cb(call)
     users=conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]; ratings=conn.execute('SELECT COUNT(*) FROM ratings').fetchone()[0]; comps=conn.execute('SELECT COUNT(*) FROM complaints').fetchone()[0]; suggs=conn.execute('SELECT COUNT(*) FROM suggestions').fetchone()[0]
-    txt=f"📊 <b>Dashboard</b>\n\nFoydalanuvchilar: <b>{users}</b>\nBaholar: <b>{ratings}</b>\nShikoyatlar: <b>{comps}</b>\nTakliflar: <b>{suggs}</b>\nBaholash: <b>{'Ochiq' if setting_bool('voting_open') else 'Yopiq'}</b>"
-    await edit_or_send(call,txt,ik([[('⬅️ Admin','admin:menu')]]))
-@dp.callback_query(F.data == 'admin:teachers')
+    voting_on = setting_bool('voting_open')
+    vote_icon = "✅ Ochiq" if voting_on else "❌ Yopiq"
+    txt=f"📊 <b>Dashboard</b>\n\nFoydalanuvchilar: <b>{users}</b>\nBaholar: <b>{ratings}</b>\nShikoyatlar: <b>{comps}</b>\nTakliflar: <b>{suggs}</b>\nBaholash: <b>{vote_icon}</b>"
+    toggle_btn = ("🔒 Baholashni yopish","voting:toggle") if voting_on else ("🔓 Baholashni ochish","voting:toggle")
+    await edit_or_send(call,txt,ik([[toggle_btn],[("⬅️ Admin",'admin:menu')]]))
 @admin_required
 async def adm_teachers(call:CallbackQuery): await answer_cb(call); await edit_or_send(call,"👨‍🏫 <b>O‘qituvchilar</b>",admin_teachers_kb())
 @dp.callback_query(F.data == 'tm:list')
@@ -1196,8 +1229,38 @@ async def adm_settings(call:CallbackQuery): await answer_cb(call); await edit_or
 @dp.callback_query(F.data.in_({'settings:voting','set:voting'}))
 @admin_required
 async def set_voting(call:CallbackQuery):
-    await answer_cb(call); cur=setting_bool('voting_open'); set_setting('voting_open','0' if cur else '1')
-    await edit_or_send(call,f"Baholash holati: <b>{'Ochiq' if not cur else 'Yopiq'}</b>", ik([[('⬅️ Sozlamalar','admin:settings')]]))
+    await answer_cb(call)
+    cur = setting_bool('voting_open')
+    status_icon = "✅ OCHIQ" if cur else "❌ YOPIQ"
+    total = conn.execute("SELECT COUNT(*) FROM ratings").fetchone()[0]
+    users_voted = conn.execute("SELECT COUNT(DISTINCT user_id) FROM ratings").fetchone()[0]
+    txt = (
+        f"🗳 <b>Baholash sozlamalari</b>\n\n"
+        f"Joriy holat: <b>{status_icon}</b>\n\n"
+        f"📊 Statistika:\n"
+        f"  Jami baholar: <b>{total}</b>\n"
+        f"  Qatnashgan foydalanuvchilar: <b>{users_voted}</b>\n\n"
+        f"{'Baholash hozir ochiq. Foydalanuvchilar baho bera olishadi.' if cur else 'Baholash yopilgan. Foydalanuvchilar baho bera olmaydi.'}"
+    )
+    toggle_label = "🔒 Baholashni yopish" if cur else "🔓 Baholashni ochish"
+    kb = ik([
+        [(toggle_label, 'voting:toggle')],
+        [('⬅️ Sozlamalar', 'admin:settings')]
+    ])
+    await edit_or_send(call, txt, kb)
+
+@dp.callback_query(F.data == 'voting:toggle')
+@admin_required
+async def voting_toggle(call:CallbackQuery):
+    await answer_cb(call)
+    cur = setting_bool('voting_open')
+    set_setting('voting_open', '0' if cur else '1')
+    new_state = not cur
+    icon = "✅ OCHIQ" if new_state else "❌ YOPIQ"
+    await call.answer(f"Baholash {icon} qilindi!", show_alert=True)
+    # refresh the voting settings page
+    await set_voting(call)
+
 @dp.callback_query(F.data.in_({'settings:deps','set:deps'}))
 @admin_required
 async def set_deps(call:CallbackQuery):
@@ -1293,15 +1356,6 @@ async def cancel_cmd(m: Message, state: FSMContext):
     await state.clear()
     await m.answer('Jarayon bekor qilindi.', reply_markup=ReplyKeyboardRemove())
     await m.answer(home_text(), reply_markup=main_kb())
-
-@dp.callback_query(F.data == 'admin:settings')
-@admin_required
-async def adm_settings_duplicate_guard(call:CallbackQuery):
-    # This guard is intentionally unreachable if the main settings handler is registered;
-    # kept only for old deployments with partial reloads.
-    await answer_cb(call)
-    await edit_or_send(call,"⚙️ <b>Sozlamalar</b>",admin_settings_kb())
-
 @dp.callback_query(F.data.startswith('settings:'))
 @dp.callback_query(F.data.startswith('set:'))
 @admin_required
